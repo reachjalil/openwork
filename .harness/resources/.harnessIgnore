@@ -1,0 +1,6 @@
+# Source-root documentation is reviewed in .harness but is not projected.
+README.md
+!skills/**/README.md
+
+# Keep the Kiro strategy skill present locally but inactive.
+skills/kiro-openwork-strategy-skill/**

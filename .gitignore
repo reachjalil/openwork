@@ -55,6 +55,12 @@ vendor/opencode/
 .opencode/node_modules/
 .opencode/bun.lock
 
+# Harness generated outputs
+/.agents/
+/.claude/
+/AGENTS.md
+/.harness/resources/skills/kiro-openwork-strategy-skill/
+
 # OpenWork workspace-local artifacts
 .opencode/openwork/
 .opencode/agents/openwork.md
@@ -62,7 +68,6 @@ vendor/opencode/
 opencode.jsonc
 .vercel
 .env*.local
-.claude/*
 .security
 transcript-analysis
 # Eval runner output

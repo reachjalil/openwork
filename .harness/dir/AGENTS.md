@@ -98,3 +98,9 @@ When uncertain, prefer: Tailwind, TypeScript, React, shadcn/ui (Base UI), TanSta
 ### Workflow
 
 - If asked to do too much work at once, stop and state that clearly.
+
+## Harness Config Maintenance
+
+- Treat `AGENTS.md`, `.agents/`, and `.claude/` as generated Harness config outputs.
+- Make durable agent-config changes in `.harness/dir` or `.harness/resources`, then run `pnpm harness:validate` and `pnpm harness:preview` before `pnpm harness:activate`.
+- Do not edit generated target folders directly unless the change is intentionally local/runtime-only and will stay out of source.
