@@ -1,6 +1,10 @@
 # 02 — Repository Map
 
-Snapshot: **2026-07-05**, public `dev` branch.
+Snapshot: **2026-07-05**, public `dev` branch. **Superseded for code-location purposes
+by `16-code-graph.md`**, which is verified on disk (HEAD `49d3f9ec`, 2026-07-06) and
+adds the workspaces this snapshot missed (`apps/installer`, `packages/install-config`,
+`packages/openwork-bootstrap`, `ee/apps/landing`, `ee/apps/den-worker-proxy`,
+`ee/apps/den-worker-runtime`). Use this doc for the narrative; use `16`/`17` for exact paths.
 
 ## Top-Level Map
 
@@ -12,15 +16,21 @@ Snapshot: **2026-07-05**, public `dev` branch.
 | `apps/orchestrator` | CLI host for OpenCode + OpenWork server + optional opencode-router. Installs `openwork` command. | Sidecar resolution, sandbox mode, health checks, multi-workspace daemon, logs. |
 | `apps/opencode-router` | Slack/Telegram bridge plus directory router for a running OpenCode server. | Messaging connectors, identity/directory routing, media sends, bot setup. |
 | `apps/ui-demo` | UI demo surface. | Design-system and component experimentation. |
+| `apps/installer` | Per-client Electron installer app with baked deployment config. | Consumes `@openwork/install-config`; distribution flows. |
 | `packages/types` | Shared wire contracts and Zod schemas. | Crucial for cross-process stability. Add shared types here before duplicating. |
 | `packages/ui` | Shared UI package with React export. | Reusable UI primitives/visuals. |
 | `packages/openwork-ui-mcp` | MCP server for semantic UI control of the desktop app. | HandsFree, OpenCode, Claude/Codex UI automation integrations. |
 | `packages/handsfree` | HandsFree integration package. | Accessibility/voice/semantic control opportunities. |
 | `ee/apps/den-api` | Cloud/Den backend API. | Enterprise/cloud auth, org/workspace APIs, MCP capability surfaces. |
 | `ee/apps/den-web` | Cloud/Den web dashboard. | Admin/user cloud UX, billing, connections, enterprise controls. |
-| `ee/apps/den-controller`, `den-worker-*` | Hosted worker orchestration/runtime. | Cloud worker provisioning, remote execution, deployment reliability. |
-| `ee/apps/inference` | Inference service/proxy. | Model/inference billing/quotas/gateway. |
-| `ee/packages/den-db` | Den database schema/migrations. | Drizzle/MySQL/PlanetScale schema, migrations, data integrity. |
+| `ee/apps/den-worker-proxy` | Hono signed-preview proxy to Daytona sandboxes. | Cloud worker access, remote execution reliability. |
+| `ee/apps/den-worker-runtime` | Build-time container root (installs orchestrator, packages opencode). | Render/Daytona image builds — **not a runtime service**. |
+| `ee/apps/den-controller` | **DEPRECATED** — renamed to `den-api`; stub only. | Do not add code here. |
+| `ee/apps/landing` | Next.js 14 marketing site. | Download/enterprise/legal pages. |
+| `ee/apps/inference` | Hono LLM gateway proxying OpenRouter. | Model/inference billing/quotas/gateway. |
+| `ee/packages/den-db` | Den database schema/migrations. | Drizzle/MySQL/PlanetScale schema, migrations, AES-256-GCM encrypted columns. |
+| `ee/packages/den-admin-mcp` | Read-only (SELECT-only) admin analytics MCP. | Ops/analytics; safe read surface. |
+| `ee/packages/utils` | Shared Den utilities (`typeid`, `skill-markdown`). | Cross-cutting Den helpers. |
 | `docs` | Roadmap and architecture docs. | High-value source of product direction; also likely stale areas to clean. |
 | `evals` | Real-app eval/proof flows. | Fraimz/e2e validation, user-visible proof. |
 | `.opencode` | Repo-local OpenCode skills/config. | Internal agent workflow conventions. |
@@ -75,10 +85,10 @@ This is important because a change often spans multiple zones:
 
 ## Architecture Drift Watchlist
 
-Two repo signals are worth verifying before repeating in an interview:
+Two repo signals — both **verified on disk at HEAD `49d3f9ec`** (not just suspected):
 
-1. The README still includes Tauri requirements and a Tauri dialog plugin note, but `apps/desktop/package.json` identifies the desktop shell as Electron with Electron builder scripts. This looks like documentation drift from the Tauri → Electron migration.
-2. The root `package.json` says `pnpm@11.4.0`, while several package manifests and README text mention `pnpm@10.27.0`. This may be intentional or stale; verify before recommending setup changes.
+1. **Tauri→Electron docs drift (confirmed).** `README.md` still lists Rust/Tauri toolchain and a Tauri dialog plugin (lines 84–85, 94, 109, 161, 164, 218) and references `apps/desktop/src-tauri/…`, but the desktop is Electron (`apps/desktop/electron/main.mjs`, `.github/workflows/build-electron-desktop.yml`). A `migration.mjs` performs a one-way Tauri→Electron handoff. Do **not** install Rust/Tauri for desktop work. High-value docs-truth cleanup.
+2. **pnpm version mismatch (confirmed).** Root `package.json` pins `pnpm@11.4.0`; `README.md` line 92 and every sub-package (`apps/{app,desktop,server,orchestrator}/package.json`) still say `pnpm@10.27.0`. The root value is authoritative for the workspace.
 
 Source anchors:
 

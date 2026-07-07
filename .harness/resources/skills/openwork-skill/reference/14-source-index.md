@@ -2,6 +2,18 @@
 
 Snapshot date: **2026-07-05**. Re-check live sources before making current-status claims.
 
+> **Two provenance classes.** The **code graph** (docs `16`–`23`, `meta/code-graph.json`)
+> was built by reading the **local checkout** at `/Users/jalillaaraichi/openwork`
+> (branch `codex/setup-fork`, HEAD `49d3f9ec`, 2026-07-06) — those paths are verified on
+> disk. The GitHub `blob/dev` URLs below remain the citation anchors for *line-level*
+> references and for briefing docs. When in a checkout, prefer local paths; the graph
+> tells you the file, this index tells you the line.
+>
+> **Freshness delta since the 2026-07-05 snapshot (7 commits):** Azure + GCP EE deploy
+> guides added (`#2495`), Slack cloud Connections (`#2496`), admin-connect on Your
+> Connections (`#2492`); `den-controller` is now **deprecated** (folded into `den-api`);
+> release cut to `v0.17.12`. Re-run the verification commands below before citing status.
+
 ## Primary Repo Sources
 
 | Source | What it supports |
@@ -30,6 +42,9 @@ Snapshot date: **2026-07-05**. Re-check live sources before making current-statu
 | `https://github.com/different-ai/openwork/blob/dev/docs/mcp-ui-control-profile.md` | Semantic UI control via MCP and bridge design. |
 | `https://github.com/different-ai/openwork/blob/dev/docs/memory-bank-architecture.md` | Memory bank roadmap, routes, data model, security, staging. |
 | `https://github.com/different-ai/openwork/blob/dev/docs/google-workspace-oauth-verification.md` | Google Workspace scopes, data use, verification blockers. |
+| `docs/single-org-mode-plan.md` | Single-org deployment mode (first pass implemented). |
+| `docs/org-install-links.md` | Organization install links for self-host operators. |
+| `docs/aws-eks-helm.md`, `docs/azure-aks-helm.md`, `docs/gcp-gke-helm.md` | EE Kubernetes/Helm deploy guides (AWS/Azure/GCP). |
 
 ## Important Line Anchors
 

@@ -2,6 +2,42 @@
   "snapshot_date": "2026-07-05",
   "repository": "https://github.com/different-ai/openwork",
   "branch": "dev",
+  "code_graph": {
+    "grounding": "local checkout",
+    "checkout_path": "/Users/jalillaaraichi/openwork",
+    "checkout_branch": "codex/setup-fork",
+    "head": "49d3f9ec",
+    "verified_date": "2026-07-06",
+    "method": "read the working tree directly (paths confirmed on disk), synthesized by parallel per-area mapping agents",
+    "artifacts": [
+      "reference/16-code-graph.md",
+      "reference/17-change-recipes.md",
+      "reference/18-data-flows.md",
+      "reference/19-entrypoints-and-processes.md",
+      "reference/20-frontend-graph.md",
+      "reference/21-host-stack-graph.md",
+      "reference/22-desktop-graph.md",
+      "reference/23-cloud-graph.md",
+      "reference/24-issue-diagnosis-playbook.md",
+      "reference/25-improvement-map.md",
+      "reference/26-agent-capability-catalog.md",
+      "meta/code-graph.json"
+    ],
+    "measured_signals": {
+      "todo_fixme_markers": "≈12 total across apps/packages/ee (marker debt is near zero; improvements found by measurement)",
+      "test_files": { "apps/server": 90, "ee/apps/den-api": 57, "apps/app": 32, "apps/opencode-router": 7, "apps/desktop": 4, "apps/orchestrator": 0, "ee/apps/inference": 0, "ee/packages/den-db": 0, "packages/types": 0 },
+      "orchestrator_cli_lines": 8761,
+      "internal_opencode_skills": 21,
+      "eval_flows": 64
+    },
+    "corrections_vs_snapshot": [
+      "added workspaces missed by the 2026-07-05 map: apps/installer, packages/install-config, packages/openwork-bootstrap, ee/apps/landing, ee/apps/den-worker-proxy, ee/apps/den-worker-runtime",
+      "ee/apps/den-controller is deprecated (folded into den-api)",
+      "confirmed Tauri->Electron README drift and pnpm 11.4.0 (root) vs 10.27.0 (subpackages) mismatch",
+      "den-api is Hono+Better-Auth; den-web is Next.js 16; landing is Next.js 14; workers use Daytona",
+      "top-level providers.tsx no longer nests GlobalSDKProvider/GlobalSyncProvider (ARCHITECTURE.md drift)"
+    ]
+  },
   "primary_sources": [
     "README.md",
     "AGENTS.md",

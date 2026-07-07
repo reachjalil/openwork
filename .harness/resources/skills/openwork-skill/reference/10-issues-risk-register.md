@@ -2,6 +2,10 @@
 
 Snapshot: public GitHub issues/PRs reviewed on **2026-07-05**. Re-check live status before referencing an issue in an interview or PR.
 
+> To actually **diagnose and fix** any of these classes, use `24-issue-diagnosis-playbook.md`
+> (symptom → check order → fix files, verified against the checkout). For where each fix
+> lands, `17-change-recipes.md`. This register stays the *what/why*; those are the *how*.
+
 ## Risk Categories
 
 | Category | What it suggests | Good contributor posture |
