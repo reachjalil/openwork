@@ -62,6 +62,7 @@ const updateOrganizationFreeSeatsSchema = z.object({
 const updateOrganizationCapabilitiesSchema = z.object({
   capabilities: z.object({
     installLinks: z.boolean().optional(),
+    mcpConnections: z.boolean().optional(),
   }),
 })
 
@@ -449,6 +450,9 @@ export function registerAdminRoutes<T extends { Variables: AuthContextVariables 
       if (body.data.capabilities.installLinks !== undefined) {
         capabilities.installLinks = body.data.capabilities.installLinks
       }
+      if (body.data.capabilities.mcpConnections !== undefined) {
+        capabilities.mcpConnections = body.data.capabilities.mcpConnections
+      }
 
       const metadata = {
         ...normalizeOrganizationMetadata(organization.metadata).metadata,
@@ -544,13 +548,15 @@ export function registerAdminRoutes<T extends { Variables: AuthContextVariables 
           userId: AuthAccountTable.userId,
           providerId: AuthAccountTable.providerId,
         })
-        .from(AuthAccountTable),
+        .from(AuthAccountTable)
+        .groupBy(AuthAccountTable.userId, AuthAccountTable.providerId),
       db
         .select({
           userId: AuthSessionTable.userId,
           day: sessionDayExpr,
         })
         .from(AuthSessionTable)
+        .where(gte(AuthSessionTable.createdAt, activityWindowStart))
         .groupBy(AuthSessionTable.userId, sessionDayExpr),
       // Non-fatal: telemetry_event may be missing in environments that never
       // ran its migration; activity then degrades to sign-in days only.

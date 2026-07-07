@@ -48,12 +48,24 @@ config:
     webAppHosts: "openwork.example.com"
     bootstrapAdminEmails: "admin@example.com"
     authCallbackUrl: "https://openwork.example.com"
+  githubConnector:
+    appId: ""
+    clientId: ""
 
 secret:
   values:
     databaseUrl: "mysql://openwork:REPLACE_ME@mysql.example.internal:3306/openwork_den?sslaccept=accept"
     betterAuthSecret: "REPLACE_WITH_AT_LEAST_32_CHARACTERS"
     denDbEncryptionKey: "REPLACE_WITH_AT_LEAST_32_CHARACTERS"
+    emailFrom: "OpenWork <no-reply@example.com>"
+    smtpHost: "smtp.example.com"
+    smtpPort: "587"
+    smtpUser: "openwork@example.com"
+    smtpPass: "REPLACE_ME"
+    smtpSecure: "false"
+    githubConnectorAppClientSecret: ""
+    githubConnectorAppPrivateKey: ""
+    githubConnectorAppWebhookSecret: ""
 
 ingress:
   enabled: true
@@ -100,7 +112,8 @@ Provider-specific starter guides:
 - Azure AKS:
   [guide](../../../docs/azure-aks-helm.md),
   [`examples/values.azure-ingress.yaml`](examples/values.azure-ingress.yaml).
-  The recommended first Azure path is AKS application routing plus
+  The recommended first Azure path is VNet-first AKS application routing plus
+  Azure Database for MySQL Flexible Server private access, with
   `ingress.enabled=true`.
 - Google Cloud GKE:
   [guide](../../../docs/gcp-gke-helm.md),
@@ -129,6 +142,77 @@ The existing Secret must contain the keys listed under `secret.keys`, especially
 - `DEN_DB_ENCRYPTION_KEY`
 
 Set `DAYTONA_API_KEY` when `config.provisioner.mode` is `daytona`. Set `POLAR_ACCESS_TOKEN` when Polar feature gating is enabled. Set `OPENROUTER_MANAGEMENT_API_KEY` when enabling OpenWork Models management.
+
+## GitHub Connector
+
+The GitHub repository connector uses a GitHub App. It is separate from GitHub
+OAuth social sign-in. Follow the full setup guide in
+[`packages/docs/start-here/github-connector-helm.mdx`](../../../packages/docs/start-here/github-connector-helm.mdx).
+
+Use these public URLs when creating the GitHub App:
+
+- Setup URL: `https://openwork.example.com/dashboard/integrations/github`
+- Webhook URL: `https://api.openwork.example.com/v1/webhooks/connectors/github`
+
+Then set the chart values:
+
+```yaml
+config:
+  githubConnector:
+    appId: "123456"
+    clientId: "Iv1.example"
+
+secret:
+  values:
+    githubConnectorAppClientSecret: "github-app-client-secret-if-used"
+    githubConnectorAppPrivateKey: |-
+      -----BEGIN PRIVATE KEY-----
+      ...
+      -----END PRIVATE KEY-----
+    githubConnectorAppWebhookSecret: "replace-with-the-github-webhook-secret"
+```
+
+The chart exposes these to Den API as:
+
+- `GITHUB_CONNECTOR_APP_ID`
+- `GITHUB_CONNECTOR_APP_CLIENT_ID`
+- `GITHUB_CONNECTOR_APP_CLIENT_SECRET`
+- `GITHUB_CONNECTOR_APP_PRIVATE_KEY`
+- `GITHUB_CONNECTOR_APP_WEBHOOK_SECRET`
+
+If `secret.create=false`, add the three secret-backed keys to the existing
+Secret referenced by `secret.existingSecret`. The app ID and client ID come from
+the chart ConfigMap.
+
+## Transactional Email
+
+Den API can send transactional email through SMTP. Configure the SMTP values in
+the chart Secret:
+
+```yaml
+secret:
+  values:
+    emailFrom: "OpenWork <no-reply@example.com>"
+    smtpHost: "smtp.example.com"
+    smtpPort: "587"
+    smtpUser: "openwork@example.com"
+    smtpPass: "REPLACE_ME"
+    smtpSecure: "false"
+```
+
+These values are exposed to Den API as:
+
+- `EMAIL_FROM`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASS`
+- `SMTP_SECURE`
+
+If `secret.create=false`, add those keys to the existing Secret referenced by
+`secret.existingSecret`. SMTP delivery requires both `EMAIL_FROM` and
+`SMTP_HOST`; leave `smtpHost` blank only when SMTP-backed transactional email
+should be disabled.
 
 ## Tenancy Mode
 

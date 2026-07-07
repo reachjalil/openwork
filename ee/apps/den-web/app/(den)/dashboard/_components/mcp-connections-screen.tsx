@@ -6,6 +6,7 @@ import { DenButton } from "../../_components/ui/button";
 import { DenInput } from "../../_components/ui/input";
 import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
 import { IntegrationIcon } from "./integration-icon";
+import { shouldShowMcpConnectionsStagingBanner } from "./mcp-connections-capability";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import {
   type CreatedMcpConnection,
@@ -20,6 +21,7 @@ import {
   useDeleteMcpConnection,
   useMcpConnectionPresets,
   useMcpConnections,
+  useNativeProviderClient,
   useSaveNativeProviderClient,
   useStartMcpConnectionOAuth,
 } from "./mcp-connections-data";
@@ -27,7 +29,15 @@ import {
 const OAUTH_POLL_INTERVAL_MS = 2000;
 const OAUTH_POLL_TIMEOUT_MS = 90_000;
 
+const GOOGLE_WORKSPACE_OPTIONAL_PERMISSIONS = [
+  { key: "gmailRead", label: "Read Gmail" },
+  { key: "driveFull", label: "Full Drive access" },
+  { key: "calendarWrite", label: "Create calendar events" },
+  { key: "chat", label: "Google Chat" },
+];
+
 export function McpConnectionsScreen() {
+  const { orgContext } = useOrgDashboard();
   const { data: connections = [], isLoading, error, refetch } = useMcpConnections();
   const { data: usableConnections = [] } = useMcpConnections("usable");
   const { data: presets = [] } = useMcpConnectionPresets();
@@ -40,6 +50,7 @@ export function McpConnectionsScreen() {
   const [formPreset, setFormPreset] = useState<ExternalMcpPreset | null>(null);
   const [googleDialogOpen, setGoogleDialogOpen] = useState(false);
   const googleConfigured = usableConnections.some((connection) => connection.id === "google-workspace");
+  const showStagingBanner = orgContext ? shouldShowMcpConnectionsStagingBanner(orgContext.capabilities) : false;
   const [pollingConnectionId, setPollingConnectionId] = useState<string | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -105,6 +116,15 @@ export function McpConnectionsScreen() {
       description="Connect any MCP server — Notion, Linear, Stripe, or a custom URL — once for the whole org. search_capabilities and execute_capability pick these up automatically."
       colors={["#E2E8F0", "#020617", "#0F172A", "#94A3B8"]}
     >
+      {showStagingBanner ? (
+        <div data-testid="mcp-connections-staging-banner" className="mb-6 rounded-[24px] border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] leading-6 text-amber-800">
+          <p className="font-semibold text-amber-900">OpenWork Connect (beta) is staged for this org.</p>
+          <p className="mt-1">
+            Connections and marketplace capabilities you set up here stay staged and invisible to members until a platform admin enables OpenWork Connect (beta) for this org. Admin management remains fully usable.
+          </p>
+        </div>
+      ) : null}
+
       {error ? (
         <div className="mb-6 rounded-[24px] border border-red-200 bg-red-50 px-5 py-4 text-[14px] text-red-700">
           {error instanceof Error ? error.message : "Failed to load MCP connections."}
@@ -239,19 +259,41 @@ function GoogleWorkspaceDialog({
   submitting: boolean;
   error: unknown;
   onClose: () => void;
-  onSubmit: (input: { clientId: string; clientSecret: string }) => void;
+  onSubmit: (input: { clientId?: string; clientSecret?: string; features: string[] }) => void;
 }) {
+  const clientConfig = useNativeProviderClient("google-workspace", open);
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
+  const [features, setFeatures] = useState<string[]>([]);
+  const featuresPrefilled = useRef(false);
 
   useEffect(() => {
     if (!open) return;
     setClientId("");
     setClientSecret("");
+    setFeatures([]);
+    featuresPrefilled.current = false;
   }, [open]);
+
+  useEffect(() => {
+    if (!open || featuresPrefilled.current || !clientConfig.isSuccess || clientConfig.isFetching) return;
+    setFeatures(clientConfig.data?.features ?? []);
+    featuresPrefilled.current = true;
+  }, [open, clientConfig.isSuccess, clientConfig.isFetching, clientConfig.data?.features]);
 
   if (!open) {
     return null;
+  }
+
+  const configured = Boolean(clientConfig.data);
+  const loadingConfig = clientConfig.isLoading;
+  const formError = error ?? clientConfig.error;
+  const trimmedClientId = clientId.trim();
+  const trimmedClientSecret = clientSecret.trim();
+  const saveDisabled = loadingConfig || (!configured && (!trimmedClientId || !trimmedClientSecret));
+
+  function toggleFeature(feature: string) {
+    setFeatures((current) => current.includes(feature) ? current.filter((entry) => entry !== feature) : [...current, feature]);
   }
 
   return (
@@ -265,14 +307,36 @@ function GoogleWorkspaceDialog({
           Paste the OAuth client from your company&apos;s Google Cloud project. Members then connect their own
           Google account from Your Connections — sign-ins stay in your org&apos;s cloud.
         </p>
+        <p className="mt-2 text-[12px] leading-5 text-gray-500">
+          Included permissions: calendar read, Gmail drafts, and selected Drive files.
+        </p>
 
         <div className="mt-5 space-y-4">
+          <div className="rounded-2xl border border-gray-100 bg-gray-50 p-4">
+            <p className="text-[13px] font-semibold text-gray-900">Optional permissions</p>
+            <p className="mt-1 text-[12px] leading-5 text-gray-500">Only add these when your team needs the extra Google access.</p>
+            <div className="mt-3 space-y-2">
+              {GOOGLE_WORKSPACE_OPTIONAL_PERMISSIONS.map((permission) => (
+                <label key={permission.key} className="flex items-center gap-2 text-[13px] text-gray-700">
+                  <input
+                    type="checkbox"
+                    data-feature={permission.key}
+                    className="h-4 w-4 rounded border-gray-300 text-gray-900"
+                    checked={features.includes(permission.key)}
+                    disabled={loadingConfig}
+                    onChange={() => toggleFeature(permission.key)}
+                  />
+                  <span>{permission.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
           <div>
             <label className="mb-1.5 block text-[12px] font-medium text-gray-700">Client ID</label>
             <DenInput
               value={clientId}
               onChange={(event) => setClientId(event.target.value)}
-              placeholder="1234567890-abc.apps.googleusercontent.com"
+              placeholder={configured ? "Saved client ID kept if left blank" : "1234567890-abc.apps.googleusercontent.com"}
             />
           </div>
           <div>
@@ -281,13 +345,13 @@ function GoogleWorkspaceDialog({
               type="password"
               value={clientSecret}
               onChange={(event) => setClientSecret(event.target.value)}
-              placeholder="GOCSPX-…"
+              placeholder={configured ? "Saved client secret kept if left blank" : "GOCSPX-…"}
             />
           </div>
         </div>
 
-        {error ? (
-          <p className="mt-3 text-[13px] text-red-600">{error instanceof Error ? error.message : "Failed to save the OAuth client."}</p>
+        {formError ? (
+          <p className="mt-3 text-[13px] text-red-600">{formError instanceof Error ? formError.message : "Failed to save the OAuth client."}</p>
         ) : null}
 
         <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
@@ -297,8 +361,12 @@ function GoogleWorkspaceDialog({
           <DenButton
             variant="primary"
             loading={submitting}
-            disabled={!clientId.trim() || !clientSecret.trim()}
-            onClick={() => onSubmit({ clientId: clientId.trim(), clientSecret: clientSecret.trim() })}
+            disabled={saveDisabled}
+            onClick={() => onSubmit({
+              ...(trimmedClientId ? { clientId: trimmedClientId } : {}),
+              ...(trimmedClientSecret ? { clientSecret: trimmedClientSecret } : {}),
+              features,
+            })}
           >
             Save
           </DenButton>
