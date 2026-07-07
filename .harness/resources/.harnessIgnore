@@ -1,0 +1,11 @@
+# Source-root documentation is reviewed in .harness but is not projected.
+README.md
+!skills/**/README.md
+
+# The Kiro strategy skill is now ACTIVE (projected to .agents/.claude).
+# Its source is git-ignored (root .gitignore) to keep it a local/private strategy
+# skill in this public repo, so we force-project it here to override that ignore.
+# Activation targets (.agents/.claude) are themselves git-ignored, so nothing
+# enters git history. To promote it to a tracked first-class skill instead, remove
+# its line from the root .gitignore, drop this block, and update .harness/MIGRATION.md.
+!skills/kiro-openwork-strategy-skill/**
