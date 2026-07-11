@@ -342,6 +342,14 @@ async function listEntireCatalog(baseUrl: string, endpoint: string, token: strin
 }
 
 describe("enterprise diagnostic OAuth MCP mock", () => {
+  test("documents the diagnostics key required by runtime controls", () => {
+    const help = Bun.spawnSync([process.execPath, script, "--help"]);
+    expect(help.exitCode).toBe(0);
+    expect(help.stdout.toString()).toContain(
+      "Request-log and\nruntime-control access require MCP_MOCK_DIAGNOSTICS_KEY.",
+    );
+  });
+
   test("prefers the isolated hub extra port over the application PORT", async () => {
     const extraPort = await getFreePort();
     const applicationPort = await getFreePort();
@@ -541,6 +549,58 @@ describe("enterprise diagnostic OAuth MCP mock", () => {
       body: JSON.stringify({ redirectUri: "http://127.0.0.1.attacker.example/callback" }),
     });
     expect(unsafe.status).toBe(400);
+
+    const replacementRedirect = "http://127.0.0.1:8790/v1/mcp-connections/emc_replacement/connect/callback";
+    const replacement = await fetch(`${mock.baseUrl}/__mock/preregistered-client-redirect`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...diagnosticsHeaders },
+      body: JSON.stringify({ redirectUri: replacementRedirect }),
+    });
+    expect(replacement.status).toBe(200);
+    expect(await replacement.json()).toMatchObject({ redirectUriCount: 2 });
+
+    const oldAuthorization = await fetch(buildAuthorizeUrl({
+      baseUrl: mock.baseUrl,
+      endpoint: "/sncapps/mcp-server/mcp/sn_mcp_server_default",
+      clientId: PREREGISTERED_CLIENT.clientId,
+      scopes: ["mcp_server"],
+      oauthPathKind: "provider",
+      overrides: { redirect_uri: runtimeRedirect },
+    }), { redirect: "manual" });
+    expect(oldAuthorization.status).toBe(400);
+
+    const replacementAuthorization = await fetch(buildAuthorizeUrl({
+      baseUrl: mock.baseUrl,
+      endpoint: "/sncapps/mcp-server/mcp/sn_mcp_server_default",
+      clientId: PREREGISTERED_CLIENT.clientId,
+      scopes: ["mcp_server"],
+      oauthPathKind: "provider",
+      overrides: { redirect_uri: replacementRedirect },
+    }), { redirect: "manual" });
+    expect(replacementAuthorization.status).toBe(302);
+  });
+
+  test("keeps runtime controls hidden when the diagnostics key is unset", async () => {
+    const mock = await startMock({
+      profile: "servicenow",
+      disableDcr: true,
+      extraEnv: { MCP_MOCK_DIAGNOSTICS_KEY: "" },
+    });
+    expect(mock.health.requestLogEnabled).toBe(false);
+
+    for (const headers of [
+      { "content-type": "application/json" },
+      { "content-type": "application/json", ...diagnosticsHeaders },
+    ]) {
+      const response = await fetch(`${mock.baseUrl}/__mock/preregistered-client-redirect`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          redirectUri: "http://127.0.0.1:8790/v1/mcp-connections/emc_hidden/connect/callback",
+        }),
+      });
+      expect(response.status).toBe(404);
+    }
   });
 
   test("uses a one-time server-side approval transaction and one-time client-bound code", async () => {

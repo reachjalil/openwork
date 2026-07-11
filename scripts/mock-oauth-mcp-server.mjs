@@ -37,8 +37,8 @@ Representative faults:
   wrong_content_type, broken_sse, empty_tool_catalog
 
 The default listener is loopback-only and all records/tokens are synthetic.
-Non-loopback binding requires --unsafe-allow-non-loopback. Request-log access
-is disabled unless MCP_MOCK_DIAGNOSTICS_KEY is configured.`);
+Non-loopback binding requires --unsafe-allow-non-loopback. Request-log and
+runtime-control access require MCP_MOCK_DIAGNOSTICS_KEY.`);
   process.exit(0);
 }
 
@@ -1372,11 +1372,11 @@ const server = http.createServer(async (req, res) => {
       }, correlationId);
       return;
     }
+    if (url.pathname.startsWith("/__mock/") && !hasDiagnosticsAccess(req)) {
+      json(res, 404, { error: "not_found" }, correlationId);
+      return;
+    }
     if (url.pathname === "/__mock/preregistered-client-redirect" && req.method === "POST") {
-      if (diagnosticsKey && !hasDiagnosticsAccess(req)) {
-        json(res, 404, { error: "not_found" }, correlationId);
-        return;
-      }
       const body = await readJson(req).catch(() => ({}));
       const redirectUri = typeof body.redirectUri === "string" ? body.redirectUri.trim() : "";
       const client = getLive(clients, mockClientId);
@@ -1384,7 +1384,10 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { error: "invalid_preregistered_redirect_uri" }, correlationId);
         return;
       }
-      const redirectUris = [...new Set([...client.redirectUris, redirectUri])];
+      // Retain the configured fixture callbacks plus one runtime callback. A
+      // later rehearsal replaces the generated callback instead of consuming
+      // another slot in the client's bounded redirect list.
+      const redirectUris = [...new Set([...preregisteredRedirectUris, redirectUri])];
       if (redirectUris.length > 10) {
         json(res, 400, { error: "too_many_preregistered_redirect_uris" }, correlationId);
         return;
