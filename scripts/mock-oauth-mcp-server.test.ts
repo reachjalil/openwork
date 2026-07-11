@@ -503,6 +503,46 @@ describe("enterprise diagnostic OAuth MCP mock", () => {
     expect(exitCode).toBe(2);
   });
 
+  test("registers an exact runtime callback for the synthetic pre-registered client", async () => {
+    const mock = await startMock({ profile: "servicenow", disableDcr: true });
+    const runtimeRedirect = "http://127.0.0.1:8790/v1/mcp-connections/emc_runtime/connect/callback";
+
+    const hidden = await fetch(`${mock.baseUrl}/__mock/preregistered-client-redirect`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirectUri: runtimeRedirect }),
+    });
+    expect(hidden.status).toBe(404);
+
+    const configured = await fetch(`${mock.baseUrl}/__mock/preregistered-client-redirect`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...diagnosticsHeaders },
+      body: JSON.stringify({ redirectUri: runtimeRedirect }),
+    });
+    expect(configured.status).toBe(200);
+    expect(await configured.json()).toMatchObject({
+      clientId: PREREGISTERED_CLIENT.clientId,
+      redirectUriCount: 2,
+    });
+
+    const authorization = await fetch(buildAuthorizeUrl({
+      baseUrl: mock.baseUrl,
+      endpoint: "/sncapps/mcp-server/mcp/sn_mcp_server_default",
+      clientId: PREREGISTERED_CLIENT.clientId,
+      scopes: ["mcp_server"],
+      oauthPathKind: "provider",
+      overrides: { redirect_uri: runtimeRedirect },
+    }), { redirect: "manual" });
+    expect(authorization.status).toBe(302);
+
+    const unsafe = await fetch(`${mock.baseUrl}/__mock/preregistered-client-redirect`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...diagnosticsHeaders },
+      body: JSON.stringify({ redirectUri: "http://127.0.0.1.attacker.example/callback" }),
+    });
+    expect(unsafe.status).toBe(400);
+  });
+
   test("uses a one-time server-side approval transaction and one-time client-bound code", async () => {
     const mock = await startMock({ profile: "generic", autoApprove: false });
     const endpoint = "/mcp";
