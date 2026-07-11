@@ -32,7 +32,7 @@ Profiles:
 Representative faults:
   expired_session, cursor_loop, provider_denied, provider_throttled,
   missing_auth_challenge, bad_resource_metadata, issuer_mismatch, no_pkce,
-  dcr_unsupported, invalid_client, invalid_grant, wrong_audience,
+  dcr_unsupported, invalid_client, invalid_grant, wrong_audience, insufficient_scope,
   unsupported_version, malformed_initialize, notification_rejected,
   wrong_content_type, broken_sse, empty_tool_catalog
 
@@ -118,6 +118,7 @@ const SUPPORTED_FAULTS = new Set([
   "invalid_client",
   "invalid_grant",
   "wrong_audience",
+  "insufficient_scope",
   "unsupported_version",
   "malformed_initialize",
   "expired_session",
@@ -155,6 +156,7 @@ const ADVERTISED_FAULTS = [
   "invalid_client",
   "invalid_grant",
   "wrong_audience",
+  "insufficient_scope",
   "unsupported_version",
   "malformed_initialize",
   "notification_rejected",
@@ -1149,6 +1151,12 @@ async function handleMcp(req, res, correlationId) {
       ? {}
       : { "www-authenticate": `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource${profile.endpoint}", scope="${profile.scopes.join(" ")}"` };
     json(res, 401, { error: "missing_mcp_token" }, correlationId, headers);
+    return;
+  }
+  if (fault === "insufficient_scope") {
+    json(res, 403, { error: "insufficient_scope" }, correlationId, {
+      "www-authenticate": `Bearer error="insufficient_scope", scope="${profile.scopes.join(" ")}"`,
+    });
     return;
   }
 

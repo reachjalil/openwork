@@ -998,6 +998,7 @@ describe("enterprise diagnostic OAuth MCP mock", () => {
       "invalid_client",
       "invalid_grant",
       "wrong_audience",
+      "insufficient_scope",
       "unsupported_version",
       "malformed_initialize",
       "notification_rejected",
