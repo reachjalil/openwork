@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { Agent, get as httpGet } from "node:http";
 import { resolve } from "node:path";
 
 const script = resolve(import.meta.dir, "mock-oauth-mcp-server.mjs");
@@ -75,12 +76,25 @@ async function startMock(options: {
       ...(options.disableDcr ? { DISABLE_DCR: "1" } : {}),
       ...options.extraEnv,
     },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
   });
+  let stderr = "";
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
   children.add(child);
   const baseUrl = `http://127.0.0.1:${port}`;
   const health = await waitForHealth(baseUrl);
-  return { child, baseUrl, health };
+  return { child, baseUrl, health, stderr: () => stderr };
+}
+
+async function getWithAgent(url: string, agent: Agent): Promise<void> {
+  await new Promise<void>((resolveRequest, rejectRequest) => {
+    const request = httpGet(url, { agent }, (response) => {
+      response.resume();
+      response.once("end", resolveRequest);
+      response.once("error", rejectRequest);
+    });
+    request.once("error", rejectRequest);
+  });
 }
 
 async function stopMock(child: ChildProcess) {
@@ -343,6 +357,20 @@ describe("enterprise diagnostic OAuth MCP mock", () => {
     const health = await waitForHealth(`http://127.0.0.1:${extraPort}`);
     expect(health.issuer).toBe(`http://127.0.0.1:${extraPort}`);
     await stopMock(child);
+  });
+
+  test("does not accumulate socket close listeners across keep-alive requests", async () => {
+    const mock = await startMock();
+    const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      for (let request = 0; request < 20; request += 1) {
+        await getWithAgent(`${mock.baseUrl}/health`, agent);
+      }
+      await Bun.sleep(25);
+      expect(mock.stderr()).not.toContain("MaxListenersExceededWarning");
+    } finally {
+      agent.destroy();
+    }
   });
 
   test("refuses non-loopback binding and exposes no permissive CORS or open logs", async () => {

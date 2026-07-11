@@ -1320,7 +1320,6 @@ const server = http.createServer(async (req, res) => {
   req.once("aborted", settleRequest);
   res.once("finish", settleRequest);
   res.once("close", settleRequest);
-  res.socket?.once("close", settleRequest);
   let correlationId = `mock-${profileName}-unassigned`;
   try {
     const url = new URL(req.url || "/", issuer);
