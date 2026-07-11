@@ -46,6 +46,7 @@ const profileName = argValue("--profile") || process.env.MCP_MOCK_PROFILE || "ge
 const fault = argValue("--fault") || process.env.MCP_MOCK_FAULT || "none";
 const responseMode = argValue("--response-mode") || process.env.MCP_MOCK_RESPONSE_MODE || "json";
 const authMode = argValue("--auth-mode") || process.env.MCP_MOCK_AUTH_MODE || "bearer";
+let operationFault = ["provider_denied", "provider_throttled"].includes(fault) ? fault : "none";
 const host = argValue("--host") || process.env.HOST || "127.0.0.1";
 const port = Number(
   argValue("--port")
@@ -1039,10 +1040,10 @@ function callTool(message, correlationId) {
   const name = message.params?.name;
   const toolDefinition = profile.tools.find((entry) => entry.name === name);
   if (!toolDefinition) return { protocolError: protocolError(message.id, -32602, `Unknown tool: ${String(name)}`) };
-  if (fault === "provider_denied") {
+  if (operationFault === "provider_denied") {
     return { result: providerError("Synthetic provider denied the operation.", "provider_policy", 403, "insufficient_privilege", correlationId) };
   }
-  if (fault === "provider_throttled") {
+  if (operationFault === "provider_throttled") {
     return { result: providerError("Synthetic provider throttled the operation.", "provider_api", 429, "rate_limited", correlationId, 2) };
   }
   const toolArgs = message.params?.arguments || {};
@@ -1345,6 +1346,7 @@ const server = http.createServer(async (req, res) => {
         responseMode,
         authMode,
         fault,
+        operationFault,
         advertisedFaults: ADVERTISED_FAULTS,
         autoApprove,
         disableDcr,
@@ -1364,6 +1366,9 @@ const server = http.createServer(async (req, res) => {
           resource,
           audience,
           scopes: profile.scopes,
+          readOnlyTools: profile.tools
+            .filter((toolDefinition) => toolDefinition.annotations?.readOnlyHint === true)
+            .map((toolDefinition) => toolDefinition.name),
           documentation: profile.documentation,
           preview: profileName === "workiq" || profileName === "agent365-mail" || profileName === "microsoft-enterprise",
         },
@@ -1394,6 +1399,16 @@ const server = http.createServer(async (req, res) => {
       }
       client.redirectUris = redirectUris;
       json(res, 200, { clientId: mockClientId, redirectUriCount: redirectUris.length }, correlationId);
+      return;
+    }
+    if (url.pathname === "/__mock/operation-fault" && req.method === "POST") {
+      const body = await readJson(req).catch(() => ({}));
+      if (!["none", "provider_denied", "provider_throttled"].includes(body.fault)) {
+        json(res, 400, { error: "invalid_operation_fault" }, correlationId);
+        return;
+      }
+      operationFault = body.fault;
+      json(res, 200, { operationFault }, correlationId);
       return;
     }
     if (url.pathname === "/requests") {

@@ -600,7 +600,17 @@ describe("enterprise diagnostic OAuth MCP mock", () => {
         }),
       });
       expect(response.status).toBe(404);
+
+      const operationFault = await fetch(`${mock.baseUrl}/__mock/operation-fault`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ fault: "provider_denied" }),
+      });
+      expect(operationFault.status).toBe(404);
     }
+
+    const health: unknown = await (await fetch(`${mock.baseUrl}/health`)).json();
+    expect(isRecord(health) && health.operationFault).toBe("none");
   });
 
   test("uses a one-time server-side approval transaction and one-time client-bound code", async () => {
@@ -1303,5 +1313,101 @@ describe("enterprise diagnostic OAuth MCP mock", () => {
     expect(body.result.isError).toBe(true);
     expect(body.result.structuredContent.category).toBe("provider_policy");
     expect(body.result.structuredContent.providerStatus).toBe(403);
+  });
+
+  test("injects operation-only provider faults after connection health succeeds", async () => {
+    const mock = await startMock({ profile: "microsoft-enterprise" });
+    expect(mock.health.operationFault).toBe("none");
+    if (!isRecord(mock.health.fixtureContract)) throw new Error("health omitted fixture contract");
+    expect(mock.health.fixtureContract.readOnlyTools).toEqual([
+      "microsoft_graph_suggest_queries",
+      "microsoft_graph_get",
+      "microsoft_graph_list_properties",
+    ]);
+
+    const initialized = await initialize(mock.baseUrl, "/enterprise", "mock-access-token");
+    const expectedCatalog = [
+      "microsoft_graph_suggest_queries",
+      "microsoft_graph_get",
+      "microsoft_graph_list_properties",
+    ];
+    expect(await listEntireCatalog(
+      mock.baseUrl,
+      "/enterprise",
+      "mock-access-token",
+      initialized.protocolVersion,
+      initialized.sessionId,
+    )).toEqual(expectedCatalog);
+
+    const call = async (id: string) => {
+      const response = await fetch(`${mock.baseUrl}/enterprise`, {
+        method: "POST",
+        headers: mcpHeaders("mock-access-token", initialized.protocolVersion, initialized.sessionId),
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: "microsoft_graph_get", arguments: { path: "/users/mock" } },
+        }),
+      });
+      expect(response.status).toBe(200);
+      return readMcpBody(response);
+    };
+
+    const healthy = await call("operation-healthy");
+    expect(isRecord(healthy.result) && healthy.result.isError).not.toBe(true);
+
+    const hidden = await fetch(`${mock.baseUrl}/__mock/operation-fault`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fault: "provider_denied" }),
+    });
+    expect(hidden.status).toBe(404);
+
+    const invalid = await fetch(`${mock.baseUrl}/__mock/operation-fault`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...diagnosticsHeaders },
+      body: JSON.stringify({ fault: "transport_failed" }),
+    });
+    expect(invalid.status).toBe(400);
+
+    const injectFault = async (fault: "none" | "provider_denied" | "provider_throttled") => {
+      const response = await fetch(`${mock.baseUrl}/__mock/operation-fault`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...diagnosticsHeaders },
+        body: JSON.stringify({ fault }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ operationFault: fault });
+    };
+
+    await injectFault("provider_denied");
+    expect(await listEntireCatalog(
+      mock.baseUrl,
+      "/enterprise",
+      "mock-access-token",
+      initialized.protocolVersion,
+      initialized.sessionId,
+    )).toEqual(expectedCatalog);
+    const denied = await call("operation-denied");
+    if (!isRecord(denied.result) || !isRecord(denied.result.structuredContent)) {
+      throw new Error("operation denial omitted structured tool result");
+    }
+    expect(denied.result.isError).toBe(true);
+    expect(denied.result.structuredContent.category).toBe("provider_policy");
+    expect(denied.result.structuredContent.providerStatus).toBe(403);
+
+    await injectFault("provider_throttled");
+    const throttled = await call("operation-throttled");
+    if (!isRecord(throttled.result) || !isRecord(throttled.result.structuredContent)) {
+      throw new Error("operation throttle omitted structured tool result");
+    }
+    expect(throttled.result.isError).toBe(true);
+    expect(throttled.result.structuredContent.category).toBe("provider_api");
+    expect(throttled.result.structuredContent.providerStatus).toBe(429);
+
+    await injectFault("none");
+    const recovered = await call("operation-recovered");
+    expect(isRecord(recovered.result) && recovered.result.isError).not.toBe(true);
   });
 });
