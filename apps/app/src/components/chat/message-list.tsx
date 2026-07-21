@@ -136,7 +136,7 @@ class ToolMessage extends React.Component<ToolMessageProps, { failed: boolean }>
 }
 
 const ToolMessageInner = ({ part }: ToolMessageProps) => {
-  const { onMcpReconnect, onMcpReopenAuthorization, onMcpRetry } = useMessageList()
+  const { onMcpReconnect, onMcpReopenAuthorization, onMcpOpenSignIn, onMcpRetry } = useMessageList()
 
   if (isBashToolPart(part)) {
     return <BashTool part={part} />
@@ -199,6 +199,7 @@ const ToolMessageInner = ({ part }: ToolMessageProps) => {
       toolPart={part}
       onReconnect={onMcpReconnect}
       onReopenAuthorization={onMcpReopenAuthorization}
+      onOpenSignIn={onMcpOpenSignIn}
       onRetry={onMcpRetry}
     />
   )

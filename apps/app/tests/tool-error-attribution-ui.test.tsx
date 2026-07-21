@@ -1,8 +1,12 @@
 import { expect, test } from "bun:test"
+import { isValidElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import type { DynamicToolUIPart } from "ai"
 
-import { Tool } from "../src/components/ui/tool"
+import type { ChatToolSignInAction } from "../src/components/tools/error-attribution"
+import { ChatMcpSignInButton, Tool } from "../src/components/ui/tool"
+
+const connectUrl = "https://connect.example.test/salesforce/start?return=chat"
 
 test("renders compact MCP attribution in a failed chat tool row", () => {
   const toolPart: DynamicToolUIPart = {
@@ -63,6 +67,108 @@ test("renders an inline reconnect button when Cloud capability discovery finds e
   expect(html).toContain("Reconnect</button>")
   expect(html).toContain("bg-amber-3/60")
   expect(html).toContain('data-testid="chat-mcp-reconnect-action"')
+})
+
+test("renders one structured sign-in action only for an authorization-required Cloud result", () => {
+  const toolPart: DynamicToolUIPart = {
+    type: "dynamic-tool",
+    toolName: "openwork-cloud_execute_capability",
+    toolCallId: "call-signin",
+    state: "output-error",
+    input: {},
+    errorText: JSON.stringify({
+      error: "authorization_required",
+      data: { connect_url: connectUrl, provider: "salesforce" },
+    }),
+  }
+  let openCalls = 0
+
+  const html = renderToStaticMarkup(
+    <Tool
+      toolPart={toolPart}
+      onOpenSignIn={async () => { openCalls += 1 }}
+      onRetry={() => undefined}
+    />,
+  )
+
+  expect(openCalls).toBe(0)
+  expect(html).toContain('data-testid="chat-mcp-signin-action"')
+  expect(html).toContain(`href="${connectUrl.replaceAll("&", "&amp;")}"`)
+  expect(html).toContain('rel="noreferrer noopener"')
+  expect(html).toContain("Sign in to salesforce")
+  expect(html.match(/data-testid="chat-mcp-signin-action"/g)?.length).toBe(1)
+})
+
+test("does not render the structured sign-in action for an unsafe URL", () => {
+  const toolPart: DynamicToolUIPart = {
+    type: "dynamic-tool",
+    toolName: "openwork-cloud_execute_capability",
+    toolCallId: "call-unsafe-signin",
+    state: "output-error",
+    input: {},
+    errorText: JSON.stringify({
+      error: "authorization_required",
+      data: { connect_url: "javascript:alert(1)", provider: "salesforce" },
+    }),
+  }
+
+  const html = renderToStaticMarkup(
+    <Tool toolPart={toolPart} onOpenSignIn={async () => undefined} />,
+  )
+
+  expect(html).not.toContain('data-testid="chat-mcp-signin-action"')
+  expect(html).toContain(">failed<")
+})
+
+test("clicking the sign-in action passes the exact URL and render never opens it", () => {
+  const opened: string[] = []
+  const action = {
+    connectUrl,
+    provider: "salesforce",
+    label: "Sign in",
+  } satisfies ChatToolSignInAction
+  const element = ChatMcpSignInButton({
+    action,
+    phase: "ready",
+    onOpenSignIn: async (url) => { opened.push(url) },
+  })
+
+  expect(opened).toEqual([])
+  if (!isValidElement<{
+    onClick: (event: { preventDefault: () => void }) => void
+    render?: unknown
+  }>(element)) throw new Error("Sign-in action did not render a React element")
+  let prevented = false
+  element.props.onClick({ preventDefault: () => { prevented = true } })
+
+  expect(prevented).toBe(true)
+  expect(opened).toEqual([connectUrl])
+})
+
+test("the opened sign-in action invokes guarded retry instead of reopening", () => {
+  const opened: string[] = []
+  const retried: ChatToolSignInAction[] = []
+  const action = {
+    connectUrl,
+    provider: "salesforce",
+    label: "Sign in",
+  } satisfies ChatToolSignInAction
+  const element = ChatMcpSignInButton({
+    action,
+    phase: "opened",
+    onOpenSignIn: async (url) => { opened.push(url) },
+    onRetry: (retryAction) => {
+      if ("connectUrl" in retryAction) retried.push(retryAction)
+    },
+  })
+
+  if (!isValidElement<{
+    onClick: (event: { preventDefault: () => void }) => void
+  }>(element)) throw new Error("Retry action did not render a React element")
+  element.props.onClick({ preventDefault: () => undefined })
+
+  expect(opened).toEqual([])
+  expect(retried).toEqual([action])
 })
 
 test("renders a copy action when a tool result is available", () => {

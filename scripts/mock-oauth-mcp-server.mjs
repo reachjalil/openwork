@@ -30,6 +30,8 @@ const errorToolStatus = Number(process.env.MOCK_ERROR_TOOL_STATUS || 403);
 const errorToolMode = (process.env.MOCK_ERROR_TOOL_MODE || "result").trim();
 const errorToolConnectUrl = (process.env.MOCK_ERROR_TOOL_CONNECT_URL || "https://connect.example.test/salesforce/start").trim();
 const errorToolProvider = (process.env.MOCK_ERROR_TOOL_PROVIDER || "salesforce").trim();
+let currentErrorToolConnectUrl = errorToolConnectUrl;
+let errorToolAuthorized = false;
 const allowUnauthenticatedMcp = process.env.MOCK_ALLOW_UNAUTHENTICATED_MCP === "1";
 
 const clients = new Map();
@@ -454,6 +456,14 @@ function mcpResult(message) {
       };
     case "tools/call":
       if (errorToolName && message.params?.name === errorToolName) {
+        if (errorToolMode === "authorization_required") {
+          return {
+            content: [{
+              type: "text",
+              text: `${errorToolProvider} provider sign-in succeeded`,
+            }],
+          };
+        }
         return {
           isError: true,
           structuredContent: {
@@ -495,11 +505,12 @@ function mcpResult(message) {
 function mcpResponse(message) {
   if (
     errorToolMode === "authorization_required"
+    && !errorToolAuthorized
     && errorToolName
     && message.method === "tools/call"
     && message.params?.name === errorToolName
   ) {
-    const connectLink = `[${errorToolConnectUrl}](${errorToolConnectUrl})`;
+    const connectLink = `[${currentErrorToolConnectUrl}](${currentErrorToolConnectUrl})`;
     return {
       jsonrpc: "2.0",
       id: message.id,
@@ -633,6 +644,25 @@ const server = http.createServer(async (req, res) => {
       tokens.clear();
       refreshTokens.clear();
       json(res, 200, { expiredAccessTokens, expiredRefreshTokens });
+      return;
+    }
+
+    if (url.pathname === "/admin/error-tool-state" && req.method === "POST") {
+      const body = await readJson(req).catch(() => ({}));
+      if (typeof body.authorized === "boolean") errorToolAuthorized = body.authorized;
+      if (typeof body.connectUrl === "string" && body.connectUrl.trim()) {
+        currentErrorToolConnectUrl = body.connectUrl.trim();
+      }
+      json(res, 200, {
+        authorized: errorToolAuthorized,
+        connectUrl: currentErrorToolConnectUrl,
+        provider: errorToolProvider,
+      });
+      return;
+    }
+
+    if (url.pathname === "/connect/salesforce" && req.method === "GET") {
+      json(res, 200, { ok: true, message: "Complete provider sign-in, then return to OpenWork." });
       return;
     }
 

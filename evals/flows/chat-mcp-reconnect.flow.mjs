@@ -17,7 +17,10 @@ const CONNECTION_PREFIX = "Research Vault";
 const CONNECTION_NAME = `${CONNECTION_PREFIX} ${Date.now()}`;
 const WORKSPACE_PATH = "/tmp/openwork-chat-mcp-reconnect";
 const ECHO_TEXT = `research vault recovered ${Date.now()}`;
-const PROVIDER_ERROR_TOOL = "mock_provider_denied";
+const AUTHORIZATION_TOOL = "request_salesforce_authorization";
+const AUTHORIZATION_CONNECT_URL = `${MOCK_SERVER_URL}/connect/salesforce`;
+const AUTHORIZATION_SUCCESS_TEXT = "salesforce provider sign-in succeeded";
+const UNSAFE_CONNECT_URL = "https://cross-origin.example.test/salesforce/start";
 const vo = await loadVoiceoverParagraphs(FLOW_ID);
 
 const state = {
@@ -26,6 +29,8 @@ const state = {
   workspaceId: null,
   reconnectBaselineConnectedAt: null,
   pendingAuthorizeUrl: null,
+  signInFailureStartedAt: null,
+  signInRetryStartedAt: null,
   mockChild: null,
   mockOutput: "",
 };
@@ -59,10 +64,12 @@ function startMockServer() {
       ISSUER: MOCK_SERVER_URL,
       AUTO_APPROVE: "0",
       STRICT_REFRESH_TOKENS: "1",
-      MOCK_ERROR_TOOL_NAME: PROVIDER_ERROR_TOOL,
-      MOCK_ERROR_TOOL_TITLE: "Provider Policy Check",
-      MOCK_ERROR_TOOL_DESCRIPTION: "Returns a provider policy denial for reconnect negative-control evidence.",
-      MOCK_ERROR_TOOL_STATUS: "403",
+      MOCK_ERROR_TOOL_NAME: AUTHORIZATION_TOOL,
+      MOCK_ERROR_TOOL_TITLE: "Salesforce Authorization Check",
+      MOCK_ERROR_TOOL_DESCRIPTION: "Requires provider sign-in until the deterministic eval admin hook marks it complete.",
+      MOCK_ERROR_TOOL_MODE: "authorization_required",
+      MOCK_ERROR_TOOL_CONNECT_URL: AUTHORIZATION_CONNECT_URL,
+      MOCK_ERROR_TOOL_PROVIDER: "salesforce",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -318,6 +325,7 @@ async function ensureWorkspace(ctx) {
     if (!activate.ok) return { ok: false, status: activate.status, text: await activate.text() };
     await window.__OPENWORK_ELECTRON__?.invokeDesktop('workspaceSetSelected', workspaceId);
     await window.__OPENWORK_ELECTRON__?.invokeDesktop('workspaceSetRuntimeActive', workspaceId);
+    await window.__OPENWORK_ELECTRON__?.invokeDesktop('openworkServerRestart', {});
     localStorage.setItem('openwork.react.activeWorkspace', workspaceId);
     let prefs = {};
     try { prefs = JSON.parse(localStorage.getItem('openwork.preferences') || '{}'); } catch {}
@@ -669,28 +677,207 @@ export default {
       },
     },
     {
-      name: "Frame 6 — provider failures remain non-reconnect errors",
+      name: "Frame 6 — provider authorization always becomes one structured sign-in action",
       run: async (ctx) => {
-        await ctx.prove("A provider policy denial is attributed without creating a misleading reconnect action", {
+        await ctx.prove("A real Den capability error renders one exact sign-in target without opening it automatically", {
           voiceover: vo[5],
           action: async () => {
+            const reset = await mockFetch("/admin/error-tool-state", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ authorized: false, connectUrl: AUTHORIZATION_CONNECT_URL }),
+            });
+            ctx.assert(reset.response.ok && reset.body.authorized === false && reset.body.connectUrl === AUTHORIZATION_CONNECT_URL, `Could not reset provider sign-in state: ${JSON.stringify(reset.body)}`);
             await createFreshTask(ctx);
-            const exactCapability = `mcp:${state.connectionId}:${PROVIDER_ERROR_TOOL}`;
-            await sendPrompt(ctx, `Use OpenWork Cloud Control to call the Research Vault provider policy check. Follow the normal sequence: first search_capabilities for "Research Vault provider policy check", then execute the exact returned capability named ${exactCapability} with body {}. Continue through the execute call and report its result.`);
+            state.signInFailureStartedAt = new Date().toISOString();
+            const exactCapability = `mcp:${state.connectionId}:${AUTHORIZATION_TOOL}`;
+            await sendPrompt(ctx, `Use OpenWork Cloud Control to call the Research Vault Salesforce authorization check. Follow the normal sequence: first search_capabilities for "Research Vault Salesforce authorization check", then execute the exact returned capability named ${exactCapability} with body {}. Continue through the execute call and report its result.`);
           },
           assert: async () => {
-            await ctx.waitFor("Boolean(document.querySelector('[aria-label^=\"Error attribution: Provider error\"]'))", { timeoutMs: 180_000, label: "provider error attribution" });
+            await ctx.waitFor("Boolean(document.querySelector('[data-testid=\"chat-mcp-signin-action\"]'))", { timeoutMs: 180_000, label: "inline MCP provider sign-in action" });
             await waitForAssistantToFinish(ctx).catch(() => undefined);
-            const actionCount = await ctx.eval("document.querySelectorAll('[data-testid=\"chat-mcp-reconnect-action\"]').length");
-            ctx.assert(actionCount === 0, `Provider error incorrectly rendered ${actionCount} reconnect action(s).`);
-            await ctx.eval("document.querySelector('[aria-label^=\"Error attribution: Provider error\"]')?.scrollIntoView({ block: 'center' })");
+            const action = await ctx.eval(`(() => {
+              const link = document.querySelector('[data-testid="chat-mcp-signin-action"]');
+              return link ? {
+                count: document.querySelectorAll('[data-testid="chat-mcp-signin-action"]').length,
+                label: (link.textContent ?? '').trim(),
+                accessibleLabel: link.getAttribute('aria-label'),
+                href: link.getAttribute('href'),
+                rel: link.getAttribute('rel'),
+              } : null;
+            })()`);
+            ctx.assert(action?.count === 1, `Expected one structured sign-in action, received ${JSON.stringify(action)}.`);
+            ctx.assert(action?.label === "Sign in to salesforce", `The sign-in action lost its safe provider label: ${JSON.stringify(action)}.`);
+            ctx.assert(action?.accessibleLabel === action.label, "The sign-in action is not exposed accessibly.");
+            ctx.assert(action?.href === AUTHORIZATION_CONNECT_URL, `Expected exact connect URL ${AUTHORIZATION_CONNECT_URL}, received ${JSON.stringify(action?.href)}.`);
+            ctx.assert(action?.rel?.includes("noopener") && action.rel.includes("noreferrer"), "The external sign-in action lost its opener protections.");
+            const requests = await recentMockRequests();
+            ctx.assert(!requests.some((entry) => entry.at >= state.signInFailureStartedAt && entry.method === "GET" && entry.url === "/connect/salesforce"), "Rendering the sign-in action opened the provider URL automatically.");
+            const reconnectCount = await ctx.eval("document.querySelectorAll('[data-testid=\"chat-mcp-reconnect-action\"]').length");
+            ctx.assert(reconnectCount === 0, `Provider sign-in incorrectly rendered ${reconnectCount} reconnect action(s).`);
+            await ctx.eval("document.querySelector('[data-testid=\"chat-mcp-signin-action\"]')?.scrollIntoView({ block: 'center' })");
             await sleep(250);
           },
           screenshot: {
-            name: "chat-mcp-provider-error-no-reconnect",
-            claim: "A real provider 403 is labeled Provider error and has no reconnect button in the isolated task.",
-            requireText: ["Provider error"],
-            rejectText: ["Reconnect required", `Reconnect ${CONNECTION_NAME}`, "Something went wrong"],
+            name: "chat-mcp-provider-signin-required",
+            claim: "The real Cloud tool row always exposes one app-authored sign-in action for the exact Den-sanitized provider URL, without auto-opening it.",
+            requireText: ["Sign-in required", "Sign in to salesforce"],
+            rejectText: ["Reconnect required", "Something went wrong"],
+          },
+        });
+      },
+    },
+    {
+      name: "Frame 7 — clicking opens the exact URL and Try again only drafts",
+      run: async (ctx) => {
+        await ctx.prove("User click opens the exact provider URL, then guarded retry remains an unsent draft", {
+          voiceover: vo[6],
+          action: async () => {
+            await ctx.eval("window.__openwork?.clearEvents()");
+            const clickedAt = new Date().toISOString();
+            await ctx.trustedClick('[data-testid="chat-mcp-signin-action"]', { timeoutMs: 20_000 });
+            const opened = await waitFor(async () => {
+              const entries = await recentMockRequests();
+              return entries.find((entry) => entry.at >= clickedAt && entry.method === "GET" && entry.url === "/connect/salesforce") ?? null;
+            }, "The desktop shell did not open the exact provider URL.", 45_000);
+            ctx.assert(opened.url === new URL(AUTHORIZATION_CONNECT_URL).pathname, `External open reached ${opened.url} instead of ${AUTHORIZATION_CONNECT_URL}.`);
+            await ctx.waitForText("Opened sign-in in your browser", { timeoutMs: 20_000 });
+            await ctx.waitForText("Try again", { timeoutMs: 20_000 });
+
+            const authorized = await mockFetch("/admin/error-tool-state", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ authorized: true }),
+            });
+            ctx.assert(authorized.response.ok && authorized.body.authorized === true, "The mock provider could not complete sign-in.");
+
+            state.signInRetryStartedAt = new Date().toISOString();
+            await ctx.trustedClick('[data-testid="chat-mcp-signin-action"]', { timeoutMs: 20_000 });
+            await ctx.waitFor(
+              `Boolean([...document.querySelectorAll('[contenteditable="true"][data-lexical-editor="true"]')].find((entry) => (entry.textContent ?? '').includes('I finished signing in') && (entry.textContent ?? '').includes('Before repeating any write action')))`,
+              { timeoutMs: 20_000, label: "provider sign-in guarded retry draft" },
+            );
+            const requests = await recentMockRequests();
+            ctx.assert(!requests.some((entry) => entry.at >= state.signInRetryStartedAt && entry.toolNames?.includes(AUTHORIZATION_TOOL)), "Try again auto-sent the provider capability instead of drafting.");
+          },
+          assert: async () => {
+            await ctx.waitFor(
+              "window.__openwork?.events(20).some((entry) => entry.name === 'mcp.chat_signin.opened')",
+              { timeoutMs: 5_000, label: "desktop sign-in inspector event" },
+            );
+            await ctx.waitFor(
+              "window.__openwork?.events(20).some((entry) => entry.name === 'mcp.chat_reconnect.retry_drafted')",
+              { timeoutMs: 5_000, label: "guarded retry inspector event" },
+            );
+            await ctx.expectText("Sign-in opened");
+            await ctx.expectText("Before repeating any write action");
+          },
+          screenshot: {
+            name: "chat-mcp-provider-signin-retry-draft",
+            claim: "After the user opens provider sign-in, Try again creates a visible guarded draft and does not send it.",
+            requireText: ["Sign-in opened", "Opened sign-in in your browser", "Before repeating any write action"],
+            rejectText: ["Something went wrong"],
+          },
+        });
+      },
+    },
+    {
+      name: "Frame 8 — sending the guarded retry succeeds after provider sign-in",
+      run: async (ctx) => {
+        await ctx.prove("Sending the user-reviewed draft reruns the real capability successfully", {
+          voiceover: vo[7],
+          action: async () => {
+            state.signInRetryStartedAt = new Date().toISOString();
+            await ctx.waitFor(
+              "window.__openworkControl.listActions().some((entry) => entry.id === 'composer.send' && entry.disabled === false)",
+              { timeoutMs: 20_000, label: "enabled guarded retry send action" },
+            );
+            await ctx.control("composer.send");
+          },
+          assert: async () => {
+            await waitForAssistantToFinish(ctx);
+            const requests = await recentMockRequests();
+            ctx.assert(requests.some((entry) => entry.at >= state.signInRetryStartedAt && entry.toolNames?.includes(AUTHORIZATION_TOOL)), "The reviewed retry did not re-run execute_capability against the provider.");
+            const expanded = await ctx.eval(`(() => {
+              const rows = [...document.querySelectorAll('button')]
+                .filter((entry) => (entry.textContent ?? '').includes('Running openwork cloud execute capability'));
+              const latest = rows.at(-1);
+              latest?.click();
+              latest?.scrollIntoView({ block: 'center' });
+              return Boolean(latest);
+            })()`);
+            ctx.assert(expanded, "The successful execute_capability tool row was not available for exact-result proof.");
+            await ctx.waitFor(
+              `[...document.querySelectorAll('pre')].some((entry) => (entry.textContent ?? '').includes(${JSON.stringify(AUTHORIZATION_SUCCESS_TEXT)}))`,
+              { timeoutMs: 10_000, label: "exact successful provider tool result" },
+            );
+          },
+          screenshot: {
+            name: "chat-mcp-provider-signin-succeeded",
+            claim: "After explicit sign-in and explicit send, the same provider capability succeeds through desktop, Den, and the real mock MCP.",
+            requireText: [AUTHORIZATION_SUCCESS_TEXT],
+            rejectText: ["Something went wrong"],
+          },
+        });
+      },
+    },
+    {
+      name: "Frame 9 — a cross-origin provider URL never becomes a button",
+      run: async (ctx) => {
+        await ctx.prove("Den origin discipline and renderer URL gates leave an unsafe provider link non-actionable", {
+          voiceover: vo[8],
+          action: async () => {
+            const unsafe = await mockFetch("/admin/error-tool-state", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ authorized: false, connectUrl: UNSAFE_CONNECT_URL }),
+            });
+            ctx.assert(unsafe.response.ok && unsafe.body.connectUrl === UNSAFE_CONNECT_URL, "The mock provider did not enter the cross-origin safety case.");
+            await createFreshTask(ctx);
+            const exactCapability = `mcp:${state.connectionId}:${AUTHORIZATION_TOOL}`;
+            await sendPrompt(ctx, `Use OpenWork Cloud Control to call the Research Vault Salesforce authorization check. First search_capabilities for "Research Vault Salesforce authorization check", then execute the exact returned capability named ${exactCapability} with body {}. Continue through the execute call and report its result.`);
+          },
+          assert: async () => {
+            await waitForAssistantToFinish(ctx);
+            const actions = await ctx.eval(`({
+              signIn: document.querySelectorAll('[data-testid="chat-mcp-signin-action"]').length,
+              reconnect: document.querySelectorAll('[data-testid="chat-mcp-reconnect-action"]').length,
+            })`);
+            ctx.assert(actions.signIn === 0, `Cross-origin provider URL rendered ${actions.signIn} sign-in action(s).`);
+            ctx.assert(actions.reconnect === 0, `Cross-origin provider URL rendered ${actions.reconnect} reconnect action(s).`);
+            const expanded = await ctx.eval(`(() => {
+              const rows = [...document.querySelectorAll('button')]
+                .filter((entry) => (entry.textContent ?? '').includes('Running openwork cloud execute capability'));
+              const latest = rows.at(-1);
+              latest?.click();
+              latest?.scrollIntoView({ block: 'center' });
+              return Boolean(latest);
+            })()`);
+            ctx.assert(expanded, "The rejected cross-origin execute_capability result was not available for raw fallback proof.");
+            await ctx.waitFor(
+              `(() => {
+                const rows = [...document.querySelectorAll('button')]
+                  .filter((entry) => (entry.textContent ?? '').includes('Running openwork cloud execute capability'));
+                const raw = rows.at(-1)?.closest('[data-slot="collapsible"]')?.querySelector('pre.text-destructive');
+                return Boolean((raw?.textContent ?? '').includes('connection_failed'));
+              })()`,
+              { timeoutMs: 10_000, label: "raw provider failure fallback" },
+            );
+            const rawResult = await ctx.eval(`(() => {
+              const rows = [...document.querySelectorAll('button')]
+                .filter((entry) => (entry.textContent ?? '').includes('Running openwork cloud execute capability'));
+              const raw = rows.at(-1)?.closest('[data-slot="collapsible"]')?.querySelector('pre.text-destructive');
+              raw?.scrollIntoView({ block: 'center' });
+              return raw?.textContent ?? '';
+            })()`);
+            ctx.assert(rawResult.includes("connection_failed"), "The cross-origin provider failure did not degrade to raw tool text.");
+            ctx.assert(!rawResult.includes(UNSAFE_CONNECT_URL), "Den relayed the rejected cross-origin provider URL into the tool result.");
+          },
+          screenshot: {
+            name: "chat-mcp-provider-signin-cross-origin-blocked",
+            claim: "A cross-origin provider-declared URL remains raw error text with no structured sign-in or reconnect action.",
+            requireText: ["connection_failed"],
+            rejectText: ["Sign-in required", "Reconnect required", UNSAFE_CONNECT_URL, "Something went wrong"],
           },
         });
       },

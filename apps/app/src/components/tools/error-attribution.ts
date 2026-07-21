@@ -12,6 +12,14 @@ export type ChatToolReconnectAction = {
   label: string
 }
 
+export type ChatToolSignInAction = {
+  connectUrl: string
+  provider?: string
+  label: "Sign in"
+}
+
+export type ChatToolRetryAction = ChatToolReconnectAction | ChatToolSignInAction
+
 export type ChatToolReconnectProgress =
   | { phase: "opening" }
   | { phase: "authorization_opened"; authorizeUrl: string }
@@ -68,6 +76,43 @@ function numberValue(record: Record<string, unknown> | null, key: string): numbe
 
 function confirmed(label: string, description: string): ToolErrorAttribution {
   return { label, confidence: "Confirmed", description }
+}
+
+function httpUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !value || /\s/.test(value)) return null
+  try {
+    const url = new URL(value)
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null
+    if (url.username || url.password) return null
+    return value
+  } catch {
+    return null
+  }
+}
+
+const SAFE_PROVIDER_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,62}[A-Za-z0-9])?$/
+
+function safeProviderLabel(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_PROVIDER_LABEL.test(value) ? value : undefined
+}
+
+export function signInActionFromChatToolResult(
+  toolName: string,
+  result: unknown,
+): ChatToolSignInAction | null {
+  // Tool output is otherwise untrusted. In particular, a connected MCP must
+  // not be able to turn its own tool result into an external navigation action.
+  if (!OPENWORK_CLOUD_CAPABILITY_TOOLS.has(toolName)) return null
+
+  const parsed = parseResultRecord(result)
+  if (!parsed) return null
+
+  if (parsed.error !== "authorization_required") return null
+  const data = isRecord(parsed.data) ? parsed.data : null
+  const connectUrl = httpUrl(data?.connect_url)
+  if (!connectUrl) return null
+  const provider = safeProviderLabel(data?.provider)
+  return { connectUrl, ...(provider ? { provider } : {}), label: "Sign in" }
 }
 
 export function reconnectActionFromChatToolResult(

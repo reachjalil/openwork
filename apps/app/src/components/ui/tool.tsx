@@ -9,9 +9,12 @@ import { Button } from "@/components/ui/button"
 import {
   attributeChatToolError,
   reconnectActionFromChatToolResult,
+  signInActionFromChatToolResult,
   type ChatToolReconnectAction,
   type ChatToolReconnectProgress,
   type ChatToolReconnectResult,
+  type ChatToolRetryAction,
+  type ChatToolSignInAction,
   type ToolErrorAttribution,
 } from "@/components/tools/error-attribution"
 import {
@@ -39,7 +42,7 @@ import {
   SquareCode,
   Wrench,
 } from "lucide-react"
-import { useCallback, useState } from "react"
+import { useCallback, useState, type MouseEvent } from "react"
 import type { DynamicToolUIPart, ToolUIPart } from "ai"
 
 function toolIcon(part: ToolPart) {
@@ -82,7 +85,8 @@ export type ToolProps = {
     onProgress: (progress: ChatToolReconnectProgress) => void,
   ) => Promise<ChatToolReconnectResult>
   onReopenAuthorization?: (action: ChatToolReconnectAction, authorizeUrl: string) => Promise<void>
-  onRetry?: (action: ChatToolReconnectAction) => void | Promise<void>
+  onOpenSignIn?: (connectUrl: string) => Promise<void>
+  onRetry?: (action: ChatToolRetryAction) => void | Promise<void>
 }
 
 const formatValue = (value: unknown): string => {
@@ -151,6 +155,89 @@ function reconnectAttribution(action: ChatToolReconnectAction, label: string): T
   }
 }
 
+function confirmedSignInAttribution(action: ChatToolSignInAction, label: string): ToolErrorAttribution {
+  const target = signInTarget(action)
+  return {
+    label,
+    confidence: "Confirmed",
+    description: target
+      ? `${target} requires sign-in before this capability can continue.`
+      : "This capability requires sign-in before it can continue.",
+  }
+}
+
+type ChatMcpSignInPhase = "ready" | "opening" | "opened" | "failed"
+
+function signInTarget(action: ChatToolSignInAction): string | undefined {
+  return action.provider
+}
+
+function signInButtonLabel(action: ChatToolSignInAction, phase: ChatMcpSignInPhase): string {
+  if (phase === "opening") return "Opening sign-in…"
+  if (phase === "opened") return "Try again"
+  if (phase === "failed") return "Try sign-in again"
+  const target = signInTarget(action)
+  return target ? `Sign in to ${target}` : action.label
+}
+
+export function ChatMcpSignInButton({
+  action,
+  phase,
+  onOpenSignIn,
+  onRetry,
+}: {
+  action: ChatToolSignInAction
+  phase: ChatMcpSignInPhase
+  onOpenSignIn: (connectUrl: string) => Promise<void>
+  onRetry?: (action: ChatToolRetryAction) => void | Promise<void>
+}) {
+  const target = signInTarget(action)
+  const buttonLabel = signInButtonLabel(action, phase)
+  const opensSignIn = phase !== "opened"
+  const accessibleLabel = phase === "opened"
+    ? `Try again after signing in${target ? ` to ${target}` : ""}`
+    : buttonLabel
+  const SignInIcon = phase === "opening" ? LoaderCircle : phase === "opened" ? RefreshCcw : ExternalLink
+
+  const handleClick = (event: MouseEvent<HTMLElement>) => {
+    event.preventDefault()
+    if (phase === "opened") {
+      void onRetry?.(action)
+      return
+    }
+    void onOpenSignIn(action.connectUrl)
+  }
+
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="xs"
+      className={cn(
+        "h-7 shrink-0 gap-1.5 rounded-lg px-2.5 font-semibold shadow-none before:shadow-none",
+        phase === "failed"
+          ? "border-destructive/30 bg-destructive/5 text-destructive hover:border-destructive/50 hover:bg-destructive/10"
+          : "border-amber-7/40 bg-amber-3/60 text-amber-11 hover:border-amber-7/60 hover:bg-amber-4/70",
+      )}
+      render={opensSignIn
+        ? <a href={action.connectUrl} target="_blank" rel="noreferrer noopener" />
+        : undefined}
+      data-testid="chat-mcp-signin-action"
+      disabled={phase === "opening" || (phase === "opened" && !onRetry)}
+      title={accessibleLabel}
+      aria-label={accessibleLabel}
+      onClick={handleClick}
+    >
+      <SignInIcon
+        data-icon="inline-start"
+        className={cn("size-3.5", phase === "opening" && "animate-spin")}
+        aria-hidden="true"
+      />
+      {buttonLabel}
+    </Button>
+  )
+}
+
 const Tool = ({
   title,
   toolPart,
@@ -158,18 +245,22 @@ const Tool = ({
   className,
   onReconnect,
   onReopenAuthorization,
+  onOpenSignIn,
   onRetry,
 }: ToolProps) => {
   const { state, input } = toolPart
   const inFlight = isToolPartInFlight(toolPart)
   const isError = state === "output-error"
-  const reconnectResult = isError && toolPart.errorText
+  const actionResult = isError && toolPart.errorText
     ? toolPart.errorText
     : state === "output-available" && "output" in toolPart
       ? toolPart.output
       : undefined
-  const reconnectAction = toolPart.type === "dynamic-tool" && reconnectResult !== undefined
-    ? reconnectActionFromChatToolResult(toolPart.toolName, reconnectResult)
+  const signInAction = toolPart.type === "dynamic-tool" && actionResult !== undefined
+    ? signInActionFromChatToolResult(toolPart.toolName, actionResult)
+    : null
+  const reconnectAction = !signInAction && toolPart.type === "dynamic-tool" && actionResult !== undefined
+    ? reconnectActionFromChatToolResult(toolPart.toolName, actionResult)
     : null
   const reconnectKey = reconnectAction
     ? chatMcpReconnectKey(toolPart.toolCallId, reconnectAction.connectionId)
@@ -187,11 +278,20 @@ const Tool = ({
   const reconnectPresentation = reconnectAction
     ? chatMcpReconnectPresentation(reconnectAction, reconnectState)
     : null
-  const errorAttribution = reconnectAction
-    ? reconnectAttribution(reconnectAction, reconnectPresentation?.badgeLabel ?? "Reconnect required")
-    : isError && toolPart.errorText
-      ? attributeChatToolError(toolPart.errorText)
-      : null
+  const [signInPhase, setSignInPhase] = useState<ChatMcpSignInPhase>("ready")
+  const [signInError, setSignInError] = useState<string | null>(null)
+  const signInBadgeLabel = signInPhase === "opened"
+    ? "Sign-in opened"
+    : signInPhase === "failed"
+      ? "Sign-in failed"
+      : "Sign-in required"
+  const errorAttribution = signInAction
+    ? confirmedSignInAttribution(signInAction, signInBadgeLabel)
+    : reconnectAction
+      ? reconnectAttribution(reconnectAction, reconnectPresentation?.badgeLabel ?? "Reconnect required")
+      : isError && toolPart.errorText
+        ? attributeChatToolError(toolPart.errorText)
+        : null
   const label = title ?? getToolActivityLabel(toolPart)
   const hasInput = input !== null && input !== undefined
   const hasOutput = "output" in toolPart && toolPart.output !== undefined
@@ -208,6 +308,19 @@ const Tool = ({
     : reconnectState === "authorization_opened"
       ? ExternalLink
       : RefreshCcw
+
+  const handleOpenSignIn = async (connectUrl: string) => {
+    if (!onOpenSignIn || signInPhase === "opening") return
+    setSignInPhase("opening")
+    setSignInError(null)
+    try {
+      await onOpenSignIn(connectUrl)
+      setSignInPhase("opened")
+    } catch (error) {
+      setSignInPhase("failed")
+      setSignInError(error instanceof Error ? error.message : "Could not open sign-in.")
+    }
+  }
 
   const handleReconnect = async () => {
     if (!reconnectAction || !reconnectKey || !onReconnect) return
@@ -298,7 +411,11 @@ const Tool = ({
             <span
               className={cn(
                 "shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-medium leading-none transition-colors",
-                reconnectAction && reconnectState === "connected"
+                signInAction && signInPhase === "failed"
+                  ? "border-destructive/30 bg-destructive/5 text-destructive"
+                  : signInAction
+                    ? "border-amber-7/30 bg-amber-3/50 text-amber-11"
+                    : reconnectAction && reconnectState === "connected"
                   ? "border-green-7/30 bg-green-3/50 text-green-11"
                   : reconnectAction && reconnectState === "failed"
                     ? "border-destructive/30 bg-destructive/5 text-destructive"
@@ -313,6 +430,14 @@ const Tool = ({
             </span>
           ) : null}
         </CollapsibleTrigger>
+        {signInAction && onOpenSignIn ? (
+          <ChatMcpSignInButton
+            action={signInAction}
+            phase={signInPhase}
+            onOpenSignIn={handleOpenSignIn}
+            onRetry={onRetry}
+          />
+        ) : null}
         {reconnectAction && onReconnect ? (
           <Button
             type="button"
@@ -354,6 +479,14 @@ const Tool = ({
           </Button>
         ) : null}
       </div>
+      {signInAction && signInPhase === "opened" ? (
+        <p className="mt-1 text-xs text-muted-foreground" data-testid="chat-mcp-signin-status">
+          Opened sign-in in your browser. Finish there, then click Try again.
+        </p>
+      ) : null}
+      {signInError ? (
+        <p className="mt-1 text-xs text-destructive" role="alert">{signInError}</p>
+      ) : null}
       {reconnectError ? (
         <p className="mt-1 text-xs text-destructive" role="alert">{reconnectError}</p>
       ) : null}
