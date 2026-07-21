@@ -84,6 +84,7 @@ import type {
   ChatToolReconnectAction,
   ChatToolReconnectProgress,
   ChatToolReconnectResult,
+  ChatToolRetryAction,
 } from "@/components/tools/error-attribution";
 import { useChatMcpReconnectStore } from "@/components/tools/mcp-reconnect-state";
 import {
@@ -91,6 +92,7 @@ import {
   waitForFreshMcpAuthorization,
   type ChatMcpReconnectScope,
 } from "./mcp-chat-reconnect";
+import { mcpChatRetryPrompt, openMcpChatSignIn } from "./mcp-chat-sign-in";
 import { OpenTargetProvider, type OpenTargetOptions } from "@/lib/target-provider";
 import type { ThreadStatus } from "@/lib/messages";
 import {
@@ -1433,14 +1435,22 @@ export function SessionSurface(props: SessionSurfaceProps) {
     });
   }, [props.sessionId, props.workspaceId]);
 
-  const handleMcpRetry = useCallback(async (action: ChatToolReconnectAction) => {
-    const prompt = `The ${action.connectionName} connection is restored. Search for the capability again and retry the previous request. Before repeating any write action, confirm it did not already complete.`;
+  const handleMcpOpenSignIn = useCallback(async (connectUrl: string) => {
+    await openMcpChatSignIn(connectUrl);
+    recordInspectorEvent("mcp.chat_signin.opened", {
+      workspaceId: props.workspaceId,
+      sessionId: props.sessionId,
+    });
+  }, [props.sessionId, props.workspaceId]);
+
+  const handleMcpRetry = useCallback(async (action: ChatToolRetryAction) => {
+    const prompt = mcpChatRetryPrompt(action);
     await typeComposerText(prompt);
     props.onDraftChange(buildDraft(prompt, attachments));
     recordInspectorEvent("mcp.chat_reconnect.retry_drafted", {
       workspaceId: props.workspaceId,
       sessionId: props.sessionId,
-      connectionId: action.connectionId,
+      ...("connectionId" in action ? { connectionId: action.connectionId } : {}),
     });
   }, [attachments, buildDraft, props.onDraftChange, props.sessionId, props.workspaceId, typeComposerText]);
 
@@ -1635,6 +1645,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
                       onEditUserMessage={handleEditUserMessage}
                       onMcpReconnect={handleMcpReconnect}
                       onMcpReopenAuthorization={handleMcpReopenAuthorization}
+                      onMcpOpenSignIn={handleMcpOpenSignIn}
                       onMcpRetry={handleMcpRetry}
                     >
                       <MessageList

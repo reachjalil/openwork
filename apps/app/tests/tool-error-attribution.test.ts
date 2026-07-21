@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test"
 import {
   attributeChatToolError,
   reconnectActionFromChatToolResult,
+  signInActionFromChatToolResult,
 } from "../src/components/tools/error-attribution"
 
 function reconnectStatus(connectionId = "emc_knowledge", connectionName = "Knowledge Hub") {
@@ -26,6 +27,68 @@ function reconnectStatus(connectionId = "emc_knowledge", connectionName = "Knowl
 }
 
 describe("chat tool error attribution", () => {
+  test("extracts a safe sign-in action from the canonical authorization-required result", () => {
+    const result = JSON.stringify({
+      error: "authorization_required",
+      message: "Open the provider sign-in page, then retry.",
+      data: {
+        connect_url: "https://connect.example.test/salesforce/start?return=chat",
+        provider: "salesforce",
+      },
+    })
+
+    expect(signInActionFromChatToolResult("openwork-cloud_execute_capability", result)).toEqual({
+      connectUrl: "https://connect.example.test/salesforce/start?return=chat",
+      provider: "salesforce",
+      label: "Sign in",
+    })
+  })
+
+  test("does not create a sign-in action for an arbitrary connected MCP tool", () => {
+    const result = JSON.stringify({
+      error: "authorization_required",
+      data: { connect_url: "https://connect.example.test/salesforce/start" },
+    })
+
+    expect(signInActionFromChatToolResult("rogue_execute_capability", result)).toBeNull()
+  })
+
+  test("rejects missing and non-http sign-in URLs", () => {
+    for (const connectUrl of [
+      "javascript:alert(1)",
+      "file:///tmp/sign-in",
+      "data:text/html,sign-in",
+      "connect.example.test/sign-in",
+      "https://connect.example.test/\tsign-in",
+      undefined,
+    ]) {
+      expect(signInActionFromChatToolResult("openwork-cloud_search_capabilities", {
+        error: "authorization_required",
+        data: { connect_url: connectUrl },
+      })).toBeNull()
+    }
+  })
+
+  test("drops an unsafe provider label without dropping the safe action", () => {
+    expect(signInActionFromChatToolResult("openwork-cloud_execute_capability", {
+      error: "authorization_required",
+      data: {
+        connect_url: "http://127.0.0.1:3994/connect/salesforce",
+        provider: "<img src=x onerror=alert(1)>",
+      },
+    })).toEqual({
+      connectUrl: "http://127.0.0.1:3994/connect/salesforce",
+      label: "Sign in",
+    })
+  })
+
+  test("does not create a sign-in action for a different error", () => {
+    expect(signInActionFromChatToolResult("openwork-cloud_execute_capability", {
+      error: "connection_failed",
+      data: { connect_url: "https://connect.example.test/salesforce/start" },
+    })).toBeNull()
+  })
+
   test("identifies an OpenWork-created capability deadline", () => {
     expect(attributeChatToolError("The capability call exceeded 180s. Retry once.")).toEqual({
       label: "OpenWork timeout",

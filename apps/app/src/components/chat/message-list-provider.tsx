@@ -5,6 +5,7 @@ import type {
   ChatToolReconnectAction,
   ChatToolReconnectProgress,
   ChatToolReconnectResult,
+  ChatToolRetryAction,
 } from "@/components/tools/error-attribution"
 import * as React from "react"
 
@@ -26,7 +27,8 @@ interface MessageListContextValue {
     onProgress: (progress: ChatToolReconnectProgress) => void,
   ) => Promise<ChatToolReconnectResult>
   onMcpReopenAuthorization: (action: ChatToolReconnectAction, authorizeUrl: string) => Promise<void>
-  onMcpRetry: (action: ChatToolReconnectAction) => void | Promise<void>
+  onMcpOpenSignIn: (connectUrl: string) => Promise<void>
+  onMcpRetry: (action: ChatToolRetryAction) => void | Promise<void>
 }
 
 const MessageListContext = React.createContext<MessageListContextValue | null>(null)
@@ -46,7 +48,8 @@ interface MessageListProviderProps {
     onProgress: (progress: ChatToolReconnectProgress) => void,
   ) => Promise<ChatToolReconnectResult>
   onMcpReopenAuthorization: (action: ChatToolReconnectAction, authorizeUrl: string) => Promise<void>
-  onMcpRetry: (action: ChatToolReconnectAction) => void | Promise<void>
+  onMcpOpenSignIn: (connectUrl: string) => Promise<void>
+  onMcpRetry: (action: ChatToolRetryAction) => void | Promise<void>
   displaySuggestions: boolean
   providerConnectedCount: number
   dispatchAction: (action: DispatchAction) => void
@@ -75,6 +78,7 @@ export function MessageListProvider({
   onEditUserMessage,
   onMcpReconnect,
   onMcpReopenAuthorization,
+  onMcpOpenSignIn,
   onMcpRetry,
 }: MessageListProviderProps) {
   const value = React.useMemo(
@@ -93,6 +97,7 @@ export function MessageListProvider({
       onEditUserMessage,
       onMcpReconnect,
       onMcpReopenAuthorization,
+      onMcpOpenSignIn,
       onMcpRetry,
     }),
     [
@@ -110,6 +115,7 @@ export function MessageListProvider({
       onEditUserMessage,
       onMcpReconnect,
       onMcpReopenAuthorization,
+      onMcpOpenSignIn,
       onMcpRetry,
     ],
   )

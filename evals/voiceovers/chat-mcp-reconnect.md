@@ -1,4 +1,4 @@
-# chat-mcp-reconnect — reconnect an expired MCP account from the chat
+# chat-mcp-reconnect — recover MCP authorization from the chat
 
 1. A connected Research Vault account expires before a requested capability runs. The normal capability search performs a live probe, identifies the exact connection, and puts a concise Reconnect Research Vault button beside the result, so the user does not have to translate setup instructions into another navigation journey.
 
@@ -8,6 +8,12 @@
 
 4. Returning to the task preserves its Reconnected state. Try again does not silently replay the previous tool; it prepares a visible draft that searches live capabilities again and warns the user to confirm a write did not already complete before repeating it.
 
-5. A new task then runs the same Research Vault capability successfully and returns its exact result. This proves the inline action repairs the credential used by the real desktop-to-Den-to-provider execution path.
+5. A new task then runs the same Research Vault capability successfully and returns its exact result. This proves the existing reconnect action still repairs the credential used by the real desktop-to-Den-to-provider execution path.
 
-6. A different failure from the provider itself is labeled Provider error and does not receive a reconnect action. Only the canonical OpenWork Cloud capability tools with one unambiguous, versioned, member-owned reauthorization target can create the button; ordinary provider failures, shared credentials, ambiguous results, and untrusted tool output stay non-actionable.
+6. A downstream Salesforce capability now asks for its own provider sign-in. Even if the assistant also repeats the URL, the failed canonical Cloud tool row deterministically shows one app-authored Sign in action whose target is the exact same-origin URL supplied through Den. Merely rendering the row never opens a browser.
+
+7. The user clicks Sign in, and the Electron shell opens that exact URL externally. OpenWork reports that sign-in was opened and offers Try again, but Try again only prepares a visible guarded draft; it neither sends a message nor replays the failed tool.
+
+8. After the mock provider records completed sign-in, the user explicitly sends the reviewed draft. The agent searches current capabilities, re-runs the exact execute capability call, and receives the provider's success result through the real desktop-to-Den-to-MCP path.
+
+9. Finally, the provider advertises a cross-origin sign-in URL. Den refuses to relay it and the renderer has no safe action to consume, so the tool row falls back to raw provider-error text with no Sign in or Reconnect button.
