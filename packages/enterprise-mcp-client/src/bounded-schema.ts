@@ -105,19 +105,26 @@ function collectSchemaMeasurements(root: unknown): {
   return { anchors, references }
 }
 
-function assertReferenceTree(input: {
+function measureReferenceHeight(input: {
   root: unknown
   value: unknown
   anchors: Map<string, unknown>
   activeTargets: WeakSet<object>
-  completeTargets: WeakSet<object>
+  referenceHeights: WeakMap<object, number>
   depth: number
-}): void {
+}): number {
   if (input.depth > ENTERPRISE_MCP_TOOL_SCHEMA_REFERENCE_DEPTH_LIMIT) {
     throw new EnterpriseMcpCatalogError("MCP_CATALOG_SCHEMA_REFERENCE_DEPTH_LIMIT")
   }
-  if (typeof input.value !== "object" || input.value === null) return
-  if (input.completeTargets.has(input.value)) return
+  if (typeof input.value !== "object" || input.value === null) return 0
+  const cachedHeight = input.referenceHeights.get(input.value)
+  if (cachedHeight !== undefined) {
+    if (input.depth + cachedHeight > ENTERPRISE_MCP_TOOL_SCHEMA_REFERENCE_DEPTH_LIMIT) {
+      throw new EnterpriseMcpCatalogError("MCP_CATALOG_SCHEMA_REFERENCE_DEPTH_LIMIT")
+    }
+    return cachedHeight
+  }
+  let referenceHeight = 0
   if (isRecord(input.value) && typeof input.value.$ref === "string") {
     const target = resolvePointer(input.root, input.value.$ref, input.anchors)
     if (typeof target === "object" && target !== null) {
@@ -125,16 +132,23 @@ function assertReferenceTree(input: {
         throw new EnterpriseMcpCatalogError("MCP_CATALOG_SCHEMA_REFERENCE_CYCLE")
       }
       input.activeTargets.add(target)
-      assertReferenceTree({ ...input, value: target, depth: input.depth + 1 })
+      referenceHeight = 1 + measureReferenceHeight({
+        ...input,
+        value: target,
+        depth: input.depth + 1,
+      })
       input.activeTargets.delete(target)
-      input.completeTargets.add(target)
     }
   }
   const children = Array.isArray(input.value) ? input.value : Object.values(input.value)
   for (const child of children) {
-    assertReferenceTree({ ...input, value: child, depth: input.depth })
+    referenceHeight = Math.max(
+      referenceHeight,
+      measureReferenceHeight({ ...input, value: child }),
+    )
   }
-  input.completeTargets.add(input.value)
+  input.referenceHeights.set(input.value, referenceHeight)
+  return referenceHeight
 }
 
 export function assertEnterpriseMcpSchema(schema: unknown): void {
@@ -151,18 +165,25 @@ export function assertEnterpriseMcpSchema(schema: unknown): void {
     throw new EnterpriseMcpCatalogError("MCP_CATALOG_SCHEMA_SIZE_LIMIT")
   }
   const { anchors, references } = collectSchemaMeasurements(schema)
+  // Cache the longest reference chain below each object. A boolean "already
+  // validated" cache would preserve cycle detection but could hide a depth
+  // violation when the same target is later reached through a longer prefix.
+  // Reference height is context-independent, so every object and edge is
+  // measured once while each entry target retains the original depth limit.
+  const referenceHeights = new WeakMap<object, number>()
+  const activeTargets = new WeakSet<object>()
   for (const reference of references) {
     const target = resolvePointer(schema, reference, anchors)
-    const activeTargets = new WeakSet<object>()
     if (typeof target === "object" && target !== null) activeTargets.add(target)
-    assertReferenceTree({
+    measureReferenceHeight({
       root: schema,
       value: target,
       anchors,
       activeTargets,
-      completeTargets: new WeakSet<object>(),
+      referenceHeights,
       depth: 0,
     })
+    if (typeof target === "object" && target !== null) activeTargets.delete(target)
   }
 }
 
@@ -176,6 +197,7 @@ function collectMcpHeaderBindings(input: {
   path: string[]
   anchors: Map<string, unknown>
   activeReferences: WeakSet<object>
+  barrenReferences: WeakSet<object>
   bindings: EnterpriseMcpHeaderParameterBinding[]
   headerNames: Set<string>
   referenceDepth: number
@@ -203,9 +225,10 @@ function collectMcpHeaderBindings(input: {
       routingHeaderError()
     }
     const target = resolvePointer(input.root, input.value.$ref, input.anchors)
-    if (typeof target === "object" && target !== null) {
+    if (typeof target === "object" && target !== null && !input.barrenReferences.has(target)) {
       if (input.activeReferences.has(target)) routingHeaderError()
       input.activeReferences.add(target)
+      const bindingsBefore = input.bindings.length
       collectMcpHeaderBindings({
         ...input,
         value: target,
@@ -213,6 +236,11 @@ function collectMcpHeaderBindings(input: {
         referenceDepth: input.referenceDepth + 1,
       })
       input.activeReferences.delete(target)
+      // A reference target whose entire closure produced no binding (and did
+      // not throw) has no routing annotation anywhere beneath it, so revisiting
+      // it via another sibling `$ref` cannot change the result. Memoizing it
+      // stops a doubling `$ref` graph from fanning out to 2^depth traversals.
+      if (input.bindings.length === bindingsBefore) input.barrenReferences.add(target)
     }
   }
 
@@ -262,6 +290,7 @@ export function extractEnterpriseMcpHeaderParameterBindings(
     path: [],
     anchors,
     activeReferences: new WeakSet<object>(),
+    barrenReferences: new WeakSet<object>(),
     bindings,
     headerNames: new Set<string>(),
     referenceDepth: 0,
