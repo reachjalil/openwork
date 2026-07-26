@@ -369,7 +369,7 @@ test("createPluginBundle rejects an unknown marketplace before any write", async
   expect(updateCalls).toBe(0)
 })
 
-test("createConfigObjectVersion updates a same-name skill without creating a duplicate", async () => {
+test("skill config objects preserve complete bodies through update and delete", async () => {
   resetDb()
   const skillName = "sales-call-prep"
   const originalSkill = `---\nname: ${skillName}\ndescription: Prepare for sales calls.\n---\nReview the account notes.`
@@ -394,6 +394,12 @@ test("createConfigObjectVersion updates a same-name skill without creating a dup
     value: { rawSourceText: updatedSkill },
   })
 
+  await storeModule.setConfigObjectLifecycle({
+    action: "delete",
+    configObjectId,
+    context: ownerContext(),
+  })
+
   expect(recordedInserts.filter((entry) => entry.table === "plugin")).toHaveLength(1)
   expect(recordedInserts.filter((entry) => entry.table === "config_object")).toHaveLength(1)
   expect(recordedInserts.filter((entry) => entry.table === "config_object_version")).toHaveLength(2)
@@ -402,6 +408,10 @@ test("createConfigObjectVersion updates a same-name skill without creating a dup
     rawSourceText: updatedSkill,
     sourceRevisionRef: "Improve preparation guidance",
   })
+  expect(recordedInserts.filter((entry) => entry.table === "config_object_version").map((entry) => entry.value.rawSourceText)).toEqual([
+    originalSkill,
+    updatedSkill,
+  ])
   expect(recordedUpdates).toContainEqual({
     table: "config_object",
     value: expect.objectContaining({
@@ -412,6 +422,12 @@ test("createConfigObjectVersion updates a same-name skill without creating a dup
         "Review the account notes and list the open risks.",
       ].join("\n"),
       title: skillName,
+    }),
+  })
+  expect(recordedUpdates).toContainEqual({
+    table: "config_object",
+    value: expect.objectContaining({
+      status: "deleted",
     }),
   })
 })
