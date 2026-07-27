@@ -986,18 +986,25 @@ describe("OpenWork Cloud catalog probe", () => {
       engineEvidenceAgeMs: 1_000,
       ...overrides,
     });
-    expect(differentialCloudVerdict(base({}))).toBe("runtime_and_engine_connected");
-    expect(differentialCloudVerdict(base({ engineRegistrationStatus: "failed" })))
+    expect(differentialCloudVerdict(base({}), true)).toBe("runtime_and_engine_connected");
+    expect(differentialCloudVerdict(base({ engineRegistrationStatus: "failed" }), true))
       .toBe("runtime_connected_engine_failed");
-    expect(differentialCloudVerdict(base({ status: "failed", code: "tls_error" })))
+    expect(differentialCloudVerdict(base({ status: "failed", code: "tls_error" }), true))
       .toBe("runtime_failed_engine_connected");
-    expect(differentialCloudVerdict(base({ status: "failed", code: "tls_error", engineRegistrationStatus: "failed" })))
+    expect(differentialCloudVerdict(base({ status: "failed", code: "tls_error", engineRegistrationStatus: "failed" }), true))
       .toBe("runtime_and_engine_failed");
-    expect(differentialCloudVerdict(base({ performed: false, status: "not-performed", code: "untrusted_endpoint" })))
+    expect(differentialCloudVerdict(base({ performed: false, status: "not-performed", code: "untrusted_endpoint" }), true))
       .toBe("runtime_probe_not_performed");
-    expect(differentialCloudVerdict(base({ engineRegistrationStatus: "not-recorded" })))
+    expect(differentialCloudVerdict(base({ engineRegistrationStatus: "not-recorded" }), true))
       .toBe("engine_evidence_stale_or_unavailable");
-    expect(differentialCloudVerdict(base({ engineEvidenceAgeMs: 120_000 })))
+    // Aged connected evidence is the engine's standing state and stays
+    // trusted; only an old failure record the reachable engine could refresh
+    // is downgraded to stale.
+    expect(differentialCloudVerdict(base({ engineEvidenceAgeMs: 120_000 }), true))
+      .toBe("runtime_and_engine_connected");
+    expect(differentialCloudVerdict(base({ engineRegistrationStatus: "failed", engineEvidenceAgeMs: 120_000 }), true))
       .toBe("engine_evidence_stale_or_unavailable");
+    expect(differentialCloudVerdict(base({ engineRegistrationStatus: "failed", engineEvidenceAgeMs: 120_000 }), false))
+      .toBe("runtime_connected_engine_failed");
   });
 });

@@ -626,7 +626,7 @@ function cloudCatalogCheck(probe: CloudCatalogProbe): AgentContextDiagnosticChec
 }
 
 function cloudDifferentialCheck(probe: CloudCatalogProbe, engineReachableNow: boolean): AgentContextDiagnosticCheck {
-  const verdict = differentialCloudVerdict(probe);
+  const verdict = differentialCloudVerdict(probe, engineReachableNow);
   const common = {
     id: "cloud-endpoint-differential" as const,
     code: verdict,

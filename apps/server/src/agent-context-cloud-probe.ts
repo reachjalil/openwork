@@ -905,15 +905,27 @@ async function performProbe(
  * Compares the independent runtime observation with the engine's cached
  * registration evidence for the same managed entry, so a report can implicate
  * the correct runtime boundary instead of collapsing both into one failure.
+ * A connected record is the engine's standing state and stays trustworthy as
+ * it ages; a failure record older than a minute while the engine is reachable
+ * could have been refreshed, so it must not implicate the engine (this
+ * mirrors the mcp_registration_stale_failure downgrade).
  */
-export function differentialCloudVerdict(probe: CloudCatalogProbe): CloudRuntimeEngineDifferential {
+export function differentialCloudVerdict(
+  probe: CloudCatalogProbe,
+  engineReachableNow: boolean,
+): CloudRuntimeEngineDifferential {
   if (!probe.performed) return "runtime_probe_not_performed";
   if (probe.engineRegistrationStatus === "not-recorded") return "engine_evidence_stale_or_unavailable";
-  if (probe.engineEvidenceAgeMs !== null && probe.engineEvidenceAgeMs > STALE_ENGINE_EVIDENCE_MS) {
+  const engineConnected = probe.engineRegistrationStatus === "connected";
+  if (
+    !engineConnected
+    && engineReachableNow
+    && probe.engineEvidenceAgeMs !== null
+    && probe.engineEvidenceAgeMs > STALE_ENGINE_EVIDENCE_MS
+  ) {
     return "engine_evidence_stale_or_unavailable";
   }
   const runtimeConnected = probe.status === "observed";
-  const engineConnected = probe.engineRegistrationStatus === "connected";
   if (runtimeConnected && engineConnected) return "runtime_and_engine_connected";
   if (runtimeConnected) return "runtime_connected_engine_failed";
   if (engineConnected) return "runtime_failed_engine_connected";
