@@ -48,3 +48,30 @@ export async function ensureSessionWorkspace(ctx, flowId) {
     { timeoutMs: 90_000, label: "session.create_task enabled" },
   );
 }
+
+export async function selectedSessionId(ctx) {
+  return ctx.eval(`(() => {
+    const route = window.__openwork?.slice?.("route");
+    if (typeof route?.selectedSessionId === "string" && route.selectedSessionId.trim()) {
+      return route.selectedSessionId.trim();
+    }
+    const controlRoute = window.__openworkControl?.snapshot?.().route || "";
+    const match = controlRoute.match(/ses_[A-Za-z0-9_-]+/);
+    return match ? match[0] : null;
+  })()`);
+}
+
+export async function waitForCreatedSession(ctx, previousSessionId, label = "created session") {
+  return ctx.waitFor(`(() => {
+    const previous = ${JSON.stringify(previousSessionId ?? "")};
+    const route = window.__openwork?.slice?.("route");
+    const selected = typeof route?.selectedSessionId === "string"
+      ? route.selectedSessionId.trim()
+      : "";
+    if (selected && selected !== previous) return selected;
+    const controlRoute = window.__openworkControl?.snapshot?.().route || "";
+    const match = controlRoute.match(/ses_[A-Za-z0-9_-]+/);
+    const routed = match ? match[0] : "";
+    return routed && routed !== previous ? routed : null;
+  })()`, { timeoutMs: 45_000, label });
+}

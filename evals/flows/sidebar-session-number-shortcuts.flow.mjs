@@ -1,4 +1,8 @@
-import { ensureSessionWorkspace } from "./lib/session-workspace.mjs";
+import {
+  ensureSessionWorkspace,
+  selectedSessionId,
+  waitForCreatedSession,
+} from "./lib/session-workspace.mjs";
 
 const READ_SHORTCUT_ROWS = `(() => [...document.querySelectorAll('[aria-keyshortcuts]')]
   .map((entry) => ({
@@ -21,12 +25,13 @@ export default {
           "sidebar-session-number-shortcuts",
         );
         for (let index = 1; index <= 3; index += 1) {
+          const previousSessionId = await selectedSessionId(ctx);
           await ctx.control("session.create_task");
-          const sessionId = await ctx.waitFor(`(() => {
-            const route = window.__openworkControl.snapshot().route || "";
-            const match = route.match(/session\\/([^/?#]+)/);
-            return match ? decodeURIComponent(match[1]) : null;
-          })()`, { timeoutMs: 30_000, label: `created session ${index}` });
+          const sessionId = await waitForCreatedSession(
+            ctx,
+            previousSessionId,
+            `created session ${index}`,
+          );
           await ctx.control("session.rename", {
             sessionId,
             title: `Shortcut proof chat ${index}`,
