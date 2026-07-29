@@ -260,7 +260,6 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [runtimeUpgradeBusy, setRuntimeUpgradeBusy] = useState(false);
-
   const [runtimeConfig, setRuntimeConfig] = useState<DenWebRuntimeConfig>(EMPTY_RUNTIME_CONFIG);
   const [runtimeConfigLoaded, setRuntimeConfigLoaded] = useState(false);
   const isSingleOrgMode = runtimeConfigLoaded && runtimeConfig.orgMode === "single_org";
@@ -324,15 +323,6 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     return getWorkerStatusMeta(item.status).bucket === workerStatusFilter;
   });
-
-  function persistAuthToken(token: string | null) {
-    setAuthToken(token);
-    if (token) {
-      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
-    } else {
-      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-    }
-  }
 
   function persistOnboardingIntent(next: OnboardingIntent | null) {
     setOnboardingIntent(next);
@@ -458,7 +448,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     const token = getToken(payload);
     if (token) {
-      persistAuthToken(token);
+      setAuthToken(token);
     }
 
     let authenticatedUser: AuthUser | null = null;
@@ -951,7 +941,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     if (!response.ok) {
       setUser(null);
       if (response.status === 401 && authToken) {
-        persistAuthToken(null);
+        setAuthToken(null);
       }
       if (!quiet) {
         setAuthError("No active session found. Sign in first.");
@@ -1310,7 +1300,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     }
 
     setUser(null);
-    persistAuthToken(null);
+    setAuthToken(null);
     setWorker(null);
     setWorkers([]);
     setWorkerLookupId("");
@@ -1872,6 +1862,14 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       window.sessionStorage.setItem(PENDING_AUTH_INTENT_STORAGE_KEY, requestedIntent);
     }
   }, []);
+
+  useEffect(() => {
+    if (authToken) {
+      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
+    } else {
+      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  }, [authToken]);
 
   useEffect(() => {
     let cancelled = false;
