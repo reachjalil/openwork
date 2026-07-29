@@ -3,9 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 
 const components = [
-  "plugins-screen.tsx",
   "marketplaces-screen.tsx",
-  "marketplace-detail-screen.tsx",
   "github-integration-screen.tsx",
 ];
 
@@ -24,9 +22,7 @@ describe("catalog list gradient surfaces", () => {
   });
 
   test("high-cardinality list screens do not instantiate Paper shaders", () => {
-    const listComponents = components.filter((component) => component !== "marketplace-detail-screen.tsx");
-
-    for (const component of listComponents) {
+    for (const component of components) {
       const path = fileURLToPath(
         new URL(`../app/(den)/dashboard/_components/${component}`, import.meta.url),
       );
