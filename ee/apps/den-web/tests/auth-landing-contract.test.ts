@@ -8,6 +8,9 @@ const authScreenPath = fileURLToPath(
 const authPanelPath = fileURLToPath(
   new URL("../app/(den)/_components/auth-panel.tsx", import.meta.url),
 );
+const denFlowProviderPath = fileURLToPath(
+  new URL("../app/(den)/_providers/den-flow-provider.tsx", import.meta.url),
+);
 
 describe("Den auth landing contract", () => {
   test("keeps the simple bounded split layout and mobile logo", () => {
@@ -61,5 +64,15 @@ describe("Den auth landing contract", () => {
     expect(source).toContain('data-testid="desktop-handoff-copy-link"');
     expect(source).toContain("desktopAuthRequested && user && !authError");
     expect(source).not.toContain("showAuthFeedback && authInfo && !authError");
+  });
+
+  test("persists a successful sign-in token before cold dashboard navigation", () => {
+    const source = readFileSync(denFlowProviderPath, "utf8");
+    const tokenPersistence = source.indexOf("persistAuthToken(token);");
+    const authenticatedUser = source.indexOf("const payloadUser = getUser(payload);");
+
+    expect(source).toContain("window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);");
+    expect(tokenPersistence).toBeGreaterThan(-1);
+    expect(tokenPersistence).toBeLessThan(authenticatedUser);
   });
 });

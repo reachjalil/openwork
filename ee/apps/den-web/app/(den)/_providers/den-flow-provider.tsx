@@ -324,6 +324,15 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     return getWorkerStatusMeta(item.status).bucket === workerStatusFilter;
   });
 
+  function persistAuthToken(token: string | null) {
+    setAuthToken(token);
+    if (token) {
+      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+    } else {
+      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  }
+
   function persistOnboardingIntent(next: OnboardingIntent | null) {
     setOnboardingIntent(next);
 
@@ -448,7 +457,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     const token = getToken(payload);
     if (token) {
-      setAuthToken(token);
+      persistAuthToken(token);
     }
 
     let authenticatedUser: AuthUser | null = null;
@@ -941,7 +950,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     if (!response.ok) {
       setUser(null);
       if (response.status === 401 && authToken) {
-        setAuthToken(null);
+        persistAuthToken(null);
       }
       if (!quiet) {
         setAuthError("No active session found. Sign in first.");
@@ -1300,7 +1309,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     }
 
     setUser(null);
-    setAuthToken(null);
+    persistAuthToken(null);
     setWorker(null);
     setWorkers([]);
     setWorkerLookupId("");
@@ -1862,14 +1871,6 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       window.sessionStorage.setItem(PENDING_AUTH_INTENT_STORAGE_KEY, requestedIntent);
     }
   }, []);
-
-  useEffect(() => {
-    if (authToken) {
-      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
-    } else {
-      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-    }
-  }, [authToken]);
 
   useEffect(() => {
     let cancelled = false;
