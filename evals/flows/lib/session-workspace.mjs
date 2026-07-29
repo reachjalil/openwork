@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 export async function ensureSessionWorkspace(ctx, flowId) {
@@ -10,11 +11,10 @@ export async function ensureSessionWorkspace(ctx, flowId) {
     "window.__openworkControl.listActions().some((action) => action.id === 'session.create_task' && !action.disabled)",
   );
   if (!canCreateTask) {
-    const workspacePath = resolve(
-      process.env.OPENWORK_EVAL_ARTIFACTS_DIR ?? "evals/results",
-      "..",
-      `${flowId}-workspace`,
-    );
+    const artifactsDir = process.env.OPENWORK_EVAL_ARTIFACTS_DIR?.trim();
+    const workspacePath = artifactsDir
+      ? resolve(artifactsDir, "..", `${flowId}-workspace`)
+      : resolve(tmpdir(), `openwork-eval-${flowId}-workspace`);
     await mkdir(workspacePath, { recursive: true });
     const welcomeInput = 'input[placeholder="/workspace/my-project"]';
     const onWelcome = await ctx.eval(
