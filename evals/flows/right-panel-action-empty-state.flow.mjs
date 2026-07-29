@@ -4,10 +4,11 @@ import {
 } from "./lib/session-workspace.mjs";
 
 const READ_CHOOSER = `(() => {
-  const panel = [...document.querySelectorAll('aside, [role="complementary"], main + div, [data-side-panel]')]
-    .find((entry) => /choose|open in (the )?side panel|side panel/i.test(entry.textContent || ''));
+  const destinations = document.querySelector('[aria-label="Panel destinations"]');
+  if (!(destinations instanceof HTMLElement)) return null;
+  const panel = destinations.parentElement;
   if (!(panel instanceof HTMLElement)) return null;
-  const actions = [...panel.querySelectorAll('button, a')]
+  const actions = [...destinations.querySelectorAll('button, a')]
     .filter((entry) => !entry.hasAttribute('disabled'))
     .map((entry) => ({
       label: (entry.getAttribute('aria-label') || entry.textContent || '').trim(),
