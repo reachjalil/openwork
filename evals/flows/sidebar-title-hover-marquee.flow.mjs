@@ -1,7 +1,6 @@
 import {
+  createSession,
   ensureSessionWorkspace,
-  selectedSessionId,
-  waitForCreatedSession,
 } from "./lib/session-workspace.mjs";
 
 const LONG_TITLE =
@@ -46,13 +45,7 @@ export default {
       name: "Overflow-only title motion preserves the sidebar row",
       run: async (ctx) => {
         await ensureSessionWorkspace(ctx, "sidebar-title-hover-marquee");
-        const previousSessionId = await selectedSessionId(ctx);
-        await ctx.control("session.create_task");
-        const sessionId = await waitForCreatedSession(
-          ctx,
-          previousSessionId,
-          "created session",
-        );
+        const sessionId = await createSession(ctx, "created session");
         await ctx.control("session.rename", { sessionId, title: LONG_TITLE });
         await ctx.waitFor(`${READ_TITLE}?.scrollWidth > ${READ_TITLE}?.clientWidth`, {
           timeoutMs: 30_000,

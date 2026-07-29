@@ -1,4 +1,7 @@
-import { ensureSessionWorkspace } from "./lib/session-workspace.mjs";
+import {
+  createSession,
+  ensureSessionWorkspace,
+} from "./lib/session-workspace.mjs";
 
 const READ_CHOOSER = `(() => {
   const panel = [...document.querySelectorAll('aside, [role="complementary"], main + div, [data-side-panel]')]
@@ -30,12 +33,11 @@ export default {
           ctx,
           "right-panel-action-empty-state",
         );
-        if (!String(await ctx.eval("window.__openworkControl.snapshot().route || ''")).includes("/session/")) {
-          await ctx.control("session.create_task");
-          await ctx.waitFor(
-            "window.__openworkControl.snapshot().route.includes('/session/')",
-            { timeoutMs: 30_000, label: "session route" },
-          );
+        const selectedSessionId = await ctx.eval(
+          "window.__openwork?.slice?.('route')?.selectedSessionId || null",
+        );
+        if (!selectedSessionId) {
+          await createSession(ctx, "right-panel session");
         }
         const opened = await ctx.eval(`(() => {
           const button = document.querySelector('button[aria-label="Open side panel"]');
