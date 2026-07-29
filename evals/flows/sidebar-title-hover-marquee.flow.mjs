@@ -7,11 +7,8 @@ const LONG_TITLE =
   "Review the OpenWork desktop sidebar title animation across a deliberately overflowing conversation name";
 
 const READ_TITLE = `(() => {
-  const title = [...document.querySelectorAll('[title], [aria-label]')]
-    .find((entry) => {
-      const label = entry.getAttribute('title') || entry.getAttribute('aria-label') || '';
-      return label === ${JSON.stringify(LONG_TITLE)};
-    });
+  const title = [...document.querySelectorAll('span')]
+    .find((entry) => (entry.textContent || '').trim() === ${JSON.stringify(LONG_TITLE)});
   if (!(title instanceof HTMLElement)) return null;
   const viewport = title.parentElement;
   if (!(viewport instanceof HTMLElement)) return null;
