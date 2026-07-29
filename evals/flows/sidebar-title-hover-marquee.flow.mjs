@@ -14,10 +14,14 @@ const readTitle = (sessionId) => `(() => {
   if (!(viewport instanceof HTMLElement)) return null;
   const title = viewport.querySelector('span[aria-hidden="true"]');
   if (!(title instanceof HTMLElement)) return null;
+  const actions = row.querySelector('[data-session-hover-actions]');
+  if (!(actions instanceof HTMLElement)) return null;
   const titleStyle = getComputedStyle(title);
   const viewportStyle = getComputedStyle(viewport);
   const titleRect = title.getBoundingClientRect();
   const viewportRect = viewport.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  const actionsRect = actions.getBoundingClientRect();
   return {
     left: titleRect.left,
     top: titleRect.top,
@@ -32,6 +36,10 @@ const readTitle = (sessionId) => `(() => {
     overflow: viewportStyle.overflow,
     viewportLeft: viewportRect.left,
     viewportRight: viewportRect.right,
+    rowLeft: rowRect.left,
+    rowRight: rowRect.right,
+    actionsLeft: actionsRect.left,
+    actionsRight: actionsRect.right,
   };
 })()`;
 
@@ -81,9 +89,11 @@ export default {
               `Expected a clipped-edge mask while the title is moving, got ${after.maskImage}.`,
             );
             ctx.assert(
-              Math.abs(after.viewportLeft - before.viewportLeft) <= 1 &&
-                Math.abs(after.viewportRight - before.viewportRight) <= 1,
-              `The title viewport moved by more than one pixel while animating: ${JSON.stringify({ before, after })}`,
+              Math.abs(after.rowLeft - before.rowLeft) <= 1 &&
+                Math.abs(after.rowRight - before.rowRight) <= 1 &&
+                Math.abs(after.actionsLeft - before.actionsLeft) <= 1 &&
+                Math.abs(after.actionsRight - before.actionsRight) <= 1,
+              `The session row or its action controls moved by more than one pixel while the title animated: ${JSON.stringify({ before, after })}`,
             );
           },
           screenshot: {
