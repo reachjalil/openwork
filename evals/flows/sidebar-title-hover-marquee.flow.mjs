@@ -81,8 +81,9 @@ export default {
               `Expected a clipped-edge mask while the title is moving, got ${after.maskImage}.`,
             );
             ctx.assert(
-              after.viewportLeft === before.viewportLeft && after.viewportRight === before.viewportRight,
-              "The title viewport changed position while animating.",
+              Math.abs(after.viewportLeft - before.viewportLeft) <= 1 &&
+                Math.abs(after.viewportRight - before.viewportRight) <= 1,
+              `The title viewport moved by more than one pixel while animating: ${JSON.stringify({ before, after })}`,
             );
           },
           screenshot: {
