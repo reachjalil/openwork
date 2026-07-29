@@ -6,12 +6,14 @@ import {
 const LONG_TITLE =
   "Review the OpenWork desktop sidebar title animation across a deliberately overflowing conversation name";
 
-const READ_TITLE = `(() => {
-  const title = [...document.querySelectorAll('span')]
-    .find((entry) => (entry.textContent || '').trim() === ${JSON.stringify(LONG_TITLE)});
-  if (!(title instanceof HTMLElement)) return null;
-  const viewport = title.parentElement;
+const readTitle = (sessionId) => `(() => {
+  const row = [...document.querySelectorAll('[data-sidebar-session-id]')]
+    .find((entry) => entry.getAttribute('data-sidebar-session-id') === ${JSON.stringify(sessionId)});
+  if (!(row instanceof HTMLElement)) return null;
+  const viewport = row.querySelector('span.min-w-0.flex-1.overflow-hidden.whitespace-nowrap');
   if (!(viewport instanceof HTMLElement)) return null;
+  const title = viewport.querySelector('span[aria-hidden="true"]');
+  if (!(title instanceof HTMLElement)) return null;
   const titleStyle = getComputedStyle(title);
   const viewportStyle = getComputedStyle(viewport);
   const titleRect = title.getBoundingClientRect();
@@ -44,12 +46,16 @@ export default {
         await ensureSessionWorkspace(ctx, "sidebar-title-hover-marquee");
         const sessionId = await createSession(ctx, "created session");
         await ctx.control("session.rename", { sessionId, title: LONG_TITLE });
-        await ctx.waitFor(`${READ_TITLE}?.scrollWidth > ${READ_TITLE}?.clientWidth`, {
-          timeoutMs: 30_000,
-          label: "overflowing session title",
-        });
+        const titleState = readTitle(sessionId);
+        await ctx.waitFor(
+          `${titleState}?.scrollWidth > ${titleState}?.clientWidth`,
+          {
+            timeoutMs: 30_000,
+            label: "overflowing session title",
+          },
+        );
 
-        const before = await ctx.eval(READ_TITLE);
+        const before = await ctx.eval(titleState);
         ctx.assert(before, "Could not measure the overflowing title.");
         await ctx.client.send("Input.dispatchMouseEvent", {
           type: "mouseMoved",
@@ -61,7 +67,7 @@ export default {
         await ctx.prove("A genuinely overflowing title moves only after hover intent and keeps clipped-edge affordance", {
           action: async () => {},
           assert: async () => {
-            const after = await ctx.eval(READ_TITLE);
+            const after = await ctx.eval(titleState);
             ctx.assert(after, "Could not measure the title after hover.");
             ctx.assert(
               after.animationName !== "none" ||
