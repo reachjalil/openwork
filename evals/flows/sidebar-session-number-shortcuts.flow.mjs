@@ -11,6 +11,23 @@ const READ_SHORTCUT_ROWS = `(() => [...document.querySelectorAll('[aria-keyshort
   }))
   .filter((entry) => entry.visible && /(?:Meta|Control)\\+[1-9]/.test(entry.shortcut || '')))()`;
 
+async function dispatchKey(ctx, payload) {
+  let timeout;
+  try {
+    await Promise.race([
+      ctx.client.send("Input.dispatchKeyEvent", payload),
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`Timed out dispatching ${payload.type} for ${payload.key}`)),
+          10_000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export default {
   id: "sidebar-session-number-shortcuts",
   title: "Platform-modifier number shortcuts match visible session order",
@@ -32,40 +49,44 @@ export default {
         }
 
         const isMac = await ctx.eval("navigator.platform.toLowerCase().includes('mac')");
-        await ctx.client.send("Input.dispatchKeyEvent", {
-          type: "keyDown",
+        const modifier = {
           key: isMac ? "Meta" : "Control",
           code: isMac ? "MetaLeft" : "ControlLeft",
+        };
+        await dispatchKey(ctx, {
+          type: "keyDown",
+          ...modifier,
           modifiers: isMac ? 4 : 2,
         });
-        await ctx.waitFor(`${READ_SHORTCUT_ROWS}.length >= 3`, {
-          timeoutMs: 20_000,
-          label: "numbered visible session rows",
-        });
+        try {
+          await ctx.waitFor(`${READ_SHORTCUT_ROWS}.length >= 3`, {
+            timeoutMs: 20_000,
+            label: "numbered visible session rows",
+          });
 
-        await ctx.prove("Modifier badges appear without changing layout and expose accessible shortcuts", {
-          action: async () => {},
-          assert: async () => {
-            const rows = await ctx.eval(READ_SHORTCUT_ROWS);
-            ctx.assert(rows.length >= 3, `Expected at least three numbered rows, got ${JSON.stringify(rows)}.`);
-            const firstNine = rows.slice(0, 9).map((entry) => entry.shortcut);
-            ctx.assert(new Set(firstNine).size === firstNine.length, "Visible session shortcuts must be unique.");
-            ctx.assert(
-              firstNine.every((shortcut, index) => shortcut.endsWith(`+${index + 1}`)),
-              `Shortcut numbering did not match visible order: ${JSON.stringify(firstNine)}.`,
-            );
-          },
-          screenshot: {
-            name: "sidebar-session-number-shortcuts-held",
-            requireText: ["Shortcut proof chat"],
-          },
-        });
-
-        await ctx.client.send("Input.dispatchKeyEvent", {
-          type: "keyUp",
-          key: isMac ? "Meta" : "Control",
-          code: isMac ? "MetaLeft" : "ControlLeft",
-        });
+          await ctx.prove("Modifier badges appear without changing layout and expose accessible shortcuts", {
+            action: async () => {},
+            assert: async () => {
+              const rows = await ctx.eval(READ_SHORTCUT_ROWS);
+              ctx.assert(rows.length >= 3, `Expected at least three numbered rows, got ${JSON.stringify(rows)}.`);
+              const firstNine = rows.slice(0, 9).map((entry) => entry.shortcut);
+              ctx.assert(new Set(firstNine).size === firstNine.length, "Visible session shortcuts must be unique.");
+              ctx.assert(
+                firstNine.every((shortcut, index) => shortcut.endsWith(`+${index + 1}`)),
+                `Shortcut numbering did not match visible order: ${JSON.stringify(firstNine)}.`,
+              );
+            },
+            screenshot: {
+              name: "sidebar-session-number-shortcuts-held",
+              requireText: ["Shortcut proof chat"],
+            },
+          });
+        } finally {
+          await dispatchKey(ctx, {
+            type: "keyUp",
+            ...modifier,
+          });
+        }
       },
     },
   ],
