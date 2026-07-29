@@ -8,6 +8,8 @@ const READ_CHOOSER = `(() => {
   if (!(destinations instanceof HTMLElement)) return null;
   const panel = destinations.parentElement;
   if (!(panel instanceof HTMLElement)) return null;
+  const panelViewport = panel.parentElement;
+  if (!(panelViewport instanceof HTMLElement)) return null;
   const actions = [...destinations.querySelectorAll('button, a')]
     .filter((entry) => !entry.hasAttribute('disabled'))
     .map((entry) => ({
@@ -18,7 +20,8 @@ const READ_CHOOSER = `(() => {
   return {
     text: (panel.textContent || '').trim(),
     actions,
-    width: Math.round(panel.getBoundingClientRect().width),
+    contentWidth: Math.round(panel.getBoundingClientRect().width),
+    panelWidth: Math.round(panelViewport.getBoundingClientRect().width),
   };
 })()`;
 
@@ -67,7 +70,10 @@ export default {
               labels.some((label) => /files|artifacts/i.test(label)),
               `Expected a Files or Artifacts destination, got ${JSON.stringify(labels)}.`,
             );
-            ctx.assert(chooser.width >= 300, `Expected a usable panel width, got ${chooser.width}px.`);
+            ctx.assert(
+              chooser.panelWidth >= 300,
+              `Expected a usable panel width, got ${chooser.panelWidth}px (${chooser.contentWidth}px content width).`,
+            );
           },
           screenshot: {
             name: "right-panel-action-chooser",
