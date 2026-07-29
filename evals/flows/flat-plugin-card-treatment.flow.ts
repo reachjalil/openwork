@@ -1,6 +1,6 @@
 import { defineFlow, type FlowContext } from "../runner/flow.ts";
 import { loadVoiceoverParagraphs } from "../runner/voiceover.ts";
-import { denApiFetch, denWebUrl, signInViaBrowser } from "./lib/den-web.mjs";
+import { denApiFetch, signInViaBrowser } from "./lib/den-web.mjs";
 
 const FLOW_ID = "flat-plugin-card-treatment";
 const vo = await loadVoiceoverParagraphs(FLOW_ID);
@@ -107,12 +107,24 @@ async function setViewport(ctx: FlowContext, width: number): Promise<void> {
   });
 }
 
-async function navigate(ctx: FlowContext, path: string): Promise<void> {
-  const url = new URL(path, denWebUrl()).toString();
-  await ctx.eval(`(() => { location.assign(${JSON.stringify(url)}); return true; })()`);
+async function openDashboardRoute(ctx: FlowContext, path: string, label: string): Promise<void> {
   await ctx.waitFor(
-    `location.pathname === ${JSON.stringify(path)} && document.readyState === 'complete'`,
-    { timeoutMs: 180_000, label: `${path} cold navigation` },
+    `(() => {
+      if (location.pathname === ${JSON.stringify(path)}) return true;
+      const link = [...document.querySelectorAll('a[href]')].find(
+        (entry) => new URL(entry.getAttribute('href') ?? '', location.href).pathname === ${JSON.stringify(path)},
+      );
+      if (link instanceof HTMLElement) {
+        link.click();
+        return false;
+      }
+      const extensions = [...document.querySelectorAll('nav a, nav button')].find(
+        (entry) => (entry.textContent ?? '').trim().startsWith('Extensions'),
+      );
+      if (extensions instanceof HTMLElement) extensions.click();
+      return false;
+    })()`,
+    { timeoutMs: 180_000, label },
   );
 }
 
@@ -155,10 +167,14 @@ export default defineFlow({
             await setViewport(ctx, 1440);
             await seedPluginCards(ctx);
             await signInViaBrowser(ctx, EMAIL, PASSWORD, ORGANIZATION_NAME);
-            await navigate(ctx, "/dashboard/plugins");
+            await openDashboardRoute(
+              ctx,
+              "/dashboard/plugins",
+              "Plugins navigation after the signed-in dashboard is interactive",
+            );
             await ctx.waitFor(
               "(document.body?.innerText ?? '').includes('Plugins')",
-              { timeoutMs: 180_000, label: "Plugins screen after cold route compilation" },
+              { timeoutMs: 180_000, label: "Plugins screen after client navigation" },
             );
             await ctx.waitFor(
               "Boolean(document.querySelector('a[href*=\"/dashboard/plugins/\"]:not([href$=\"/new\"]):not([href$=\"/import\"])'))",
@@ -170,7 +186,16 @@ export default defineFlow({
               "Den",
             );
 
-            await navigate(ctx, `/dashboard/marketplaces/${encodeURIComponent(state.marketplaceId)}`);
+            await openDashboardRoute(
+              ctx,
+              "/dashboard/marketplaces",
+              "Marketplace navigation from the signed-in dashboard",
+            );
+            await openDashboardRoute(
+              ctx,
+              `/dashboard/marketplaces/${encodeURIComponent(state.marketplaceId)}`,
+              "deterministically seeded Marketplace detail navigation",
+            );
             await ctx.waitFor("Boolean(document.querySelector('div[id^=\"plugin-\"]'))", {
               timeoutMs: 60_000,
               label: "deterministically seeded Marketplace Plugin card after cold route compilation",
