@@ -24,28 +24,29 @@ const SPOOFABLE_FORWARDING_HEADERS = new Set(["forwarded", "x-forwarded-host", "
  * a static CORS allowlist. The signed-in SPA running there has to reach Den for
  * /v1/me, /v1/me/orgs, MCP tokens and org connections.
  *
- * We reflect those origins, and make that safe by stripping the cookie header
- * from the forwarded request: an instance-origin call is authenticated by its
- * bearer token alone and can never ride the viewer's app.openworklabs.com
- * session. A hostile page on some other origin therefore gains nothing from the
- * reflection - it has no bearer token and its cookies are discarded.
+ * We reflect those origins, and make that safe by stripping cookies in both
+ * directions, disabling credentialed CORS, and rejecting session-auth routes.
+ * An instance-origin call is authenticated by its bearer token alone and can
+ * never ride the viewer's app.openworklabs.com session.
  *
  * Only the Den API proxy opts in; /api/auth keeps cookies and the strict
  * allowlist, because that is where sessions are actually established.
  */
 const DEN_API_ROUTE_PREFIX = "/api/den";
 const DEFAULT_CLOUD_INSTANCE_ORIGIN_SUFFIXES = [".daytonaproxy01.net"];
+const CLOUD_INSTANCE_ORIGIN_SUFFIX_PATTERN = /^\.(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/;
 const CORS_ALLOW_HEADERS = "authorization,content-type,x-openwork-org-id,x-request-id,accept";
+const CORS_ALLOW_HEADER_NAMES = new Set(CORS_ALLOW_HEADERS.split(","));
 const CORS_ALLOW_METHODS = "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS";
 
 function cloudInstanceOriginSuffixes(): string[] {
-  const configured = process.env.DEN_CLOUD_INSTANCE_ORIGIN_SUFFIXES?.trim();
-  if (!configured) return DEFAULT_CLOUD_INSTANCE_ORIGIN_SUFFIXES;
+  const configured = process.env.DEN_CLOUD_INSTANCE_ORIGIN_SUFFIXES;
+  if (configured === undefined) return DEFAULT_CLOUD_INSTANCE_ORIGIN_SUFFIXES;
   const parsed = configured
     .split(",")
-    .map((entry) => entry.trim().toLowerCase())
-    .filter((entry) => entry.startsWith("."));
-  return parsed.length > 0 ? parsed : DEFAULT_CLOUD_INSTANCE_ORIGIN_SUFFIXES;
+    .map((entry) => entry.trim().toLowerCase());
+  if (parsed.some((entry) => !CLOUD_INSTANCE_ORIGIN_SUFFIX_PATTERN.test(entry))) return [];
+  return parsed;
 }
 
 function isCloudInstanceOrigin(origin: string | null): boolean {
@@ -66,13 +67,26 @@ function reflectsCloudInstanceOrigin(request: NextRequest, options: ProxyOptions
 }
 
 function applyCloudInstanceCorsHeaders(headers: Headers, origin: string): void {
+  headers.delete("access-control-allow-credentials");
   // Never emit a second allow-origin: browsers reject duplicates, and den-api
   // already reflects on the grant-exchange route.
   if (!headers.has("access-control-allow-origin")) {
     headers.set("access-control-allow-origin", origin);
-    headers.set("access-control-allow-credentials", "true");
   }
   headers.append("vary", "Origin");
+}
+
+function hasUnsupportedCorsRequestHeaders(request: NextRequest): boolean {
+  const requested = request.headers.get("access-control-request-headers");
+  if (!requested) return false;
+  return requested
+    .split(",")
+    .some((name) => !CORS_ALLOW_HEADER_NAMES.has(name.trim().toLowerCase()));
+}
+
+function isSessionAuthenticationPath(targetPath: string): boolean {
+  const normalized = normalizePathPrefix(targetPath);
+  return normalized === "api/auth" || normalized.startsWith("api/auth/");
 }
 
 type ProxyOptions = {
@@ -203,7 +217,13 @@ function rewriteLocationHeader(location: string, request: NextRequest, apiBase: 
   return `${requestOrigin}${parsedLocation.pathname}${parsedLocation.search}${parsedLocation.hash}`;
 }
 
-function cloneResponseHeaders(request: NextRequest, upstream: Response, options: ProxyOptions, apiBase: string): Headers {
+function cloneResponseHeaders(
+  request: NextRequest,
+  upstream: Response,
+  options: ProxyOptions,
+  apiBase: string,
+  stripCookies = false,
+): Headers {
   const headers = new Headers();
   upstream.headers.forEach((value, name) => {
     if (shouldSkipResponseHeader(name)) return;
@@ -213,7 +233,7 @@ function cloneResponseHeaders(request: NextRequest, upstream: Response, options:
     }
     headers.append(name, value);
   });
-  copySetCookieHeaders(upstream.headers, headers);
+  if (!stripCookies) copySetCookieHeaders(upstream.headers, headers);
   return headers;
 }
 
@@ -267,15 +287,21 @@ export async function proxyUpstream(
   const instanceOrigin = reflectsCloudInstanceOrigin(request, options)
     ? request.headers.get("origin")
     : null;
+  const targetPath = getTargetPath(request, segments, options.routePrefix);
+
+  if (instanceOrigin && isSessionAuthenticationPath(targetPath)) {
+    return buildUpstreamErrorResponse(403, "Session authentication routes are unavailable to reflected origins.");
+  }
 
   // Answer the preflight here: den-api's allowlist cannot know this origin, and
   // the browser will not send the real request without it.
   if (instanceOrigin && request.method === "OPTIONS") {
+    if (hasUnsupportedCorsRequestHeaders(request)) {
+      return buildUpstreamErrorResponse(400, "Unsupported CORS request header.");
+    }
     const preflight = new Headers({
       "access-control-allow-origin": instanceOrigin,
-      "access-control-allow-credentials": "true",
-      "access-control-allow-headers":
-        request.headers.get("access-control-request-headers") ?? CORS_ALLOW_HEADERS,
+      "access-control-allow-headers": CORS_ALLOW_HEADERS,
       "access-control-allow-methods": CORS_ALLOW_METHODS,
       "access-control-max-age": "600",
     });
@@ -283,7 +309,6 @@ export async function proxyUpstream(
     return new Response(null, { status: 204, headers: preflight });
   }
 
-  const targetPath = getTargetPath(request, segments, options.routePrefix);
   const targetUrl = buildTargetUrl(apiBase, request, targetPath, options.upstreamPathPrefix);
   let upstream: Response;
   try {
@@ -315,7 +340,7 @@ export async function proxyUpstream(
   });
 
   const shouldDropBody = request.method === "HEAD" || NO_BODY_STATUS.has(upstream.status);
-  const responseHeaders = cloneResponseHeaders(request, upstream, options, apiBase);
+  const responseHeaders = cloneResponseHeaders(request, upstream, options, apiBase, instanceOrigin !== null);
   if (instanceOrigin) {
     applyCloudInstanceCorsHeaders(responseHeaders, instanceOrigin);
   }
