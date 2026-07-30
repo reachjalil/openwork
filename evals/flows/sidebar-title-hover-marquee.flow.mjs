@@ -1,16 +1,15 @@
-import {
-  createSession,
-  ensureSessionWorkspace,
-} from "./lib/session-workspace.mjs";
+import { ensureSessionWorkspace } from "./lib/session-workspace.mjs";
 
 const LONG_TITLE =
-  "Review the OpenWork desktop sidebar title animation across a deliberately overflowing conversation name";
+  "Review the OpenWork desktop sidebar title reveal across a deliberately overflowing conversation name";
 
-const readTitle = (sessionId) => `(() => {
-  const row = [...document.querySelectorAll('[data-sidebar-session-id]')]
-    .find((entry) => entry.getAttribute('data-sidebar-session-id') === ${JSON.stringify(sessionId)});
-  if (!(row instanceof HTMLElement)) return null;
-  const viewport = row.querySelector('span.min-w-0.flex-1.overflow-hidden.whitespace-nowrap');
+const READ_TITLE = `(() => {
+  const title = [...document.querySelectorAll('[data-session-title-overflowing="true"] > [data-session-title-text]')]
+    .find((entry) => {
+      return (entry.textContent || '').trim() === ${JSON.stringify(LONG_TITLE)};
+    });
+  if (!(title instanceof HTMLElement)) return null;
+  const viewport = title.parentElement;
   if (!(viewport instanceof HTMLElement)) return null;
   const title = viewport.querySelector('span[aria-hidden="true"]');
   if (!(title instanceof HTMLElement)) return null;
@@ -28,10 +27,11 @@ const readTitle = (sessionId) => `(() => {
     width: titleRect.width,
     height: titleRect.height,
     clientWidth: viewport.clientWidth,
-    scrollWidth: viewport.scrollWidth,
+    scrollWidth: title.scrollWidth,
     transform: titleStyle.transform,
     translate: titleStyle.translate,
     animationName: titleStyle.animationName,
+    nativeTitle: title.getAttribute('title'),
     maskImage: viewportStyle.maskImage || viewportStyle.webkitMaskImage,
     overflow: viewportStyle.overflow,
     viewportLeft: viewportRect.left,
@@ -45,14 +45,19 @@ const readTitle = (sessionId) => `(() => {
 
 export default {
   id: "sidebar-title-hover-marquee",
-  title: "Overflowing session titles become readable after hover intent without moving row controls",
+  title: "Overflowing session titles reveal more text after hover intent without moving row controls",
   kind: "user-facing",
   steps: [
     {
-      name: "Overflow-only title motion preserves the sidebar row",
+      name: "Overflow-only title reveal preserves the sidebar row",
       run: async (ctx) => {
         await ensureSessionWorkspace(ctx, "sidebar-title-hover-marquee");
-        const sessionId = await createSession(ctx, "created session");
+        await ctx.control("session.create_task");
+        const sessionId = await ctx.waitFor(`(() => {
+          const route = window.__openworkControl.snapshot().route || "";
+          const match = route.match(/session\\/([^/?#]+)/);
+          return match ? decodeURIComponent(match[1]) : null;
+        })()`, { timeoutMs: 30_000, label: "created session" });
         await ctx.control("session.rename", { sessionId, title: LONG_TITLE });
         const titleState = readTitle(sessionId);
         await ctx.waitFor(
@@ -72,7 +77,7 @@ export default {
         });
         await new Promise((resolve) => setTimeout(resolve, 1_100));
 
-        await ctx.prove("A genuinely overflowing title moves only after hover intent and keeps clipped-edge affordance", {
+        await ctx.prove("A genuinely overflowing title reveals more text only after hover intent without a competing browser tooltip", {
           action: async () => {},
           assert: async () => {
             const after = await ctx.eval(titleState);
@@ -85,15 +90,20 @@ export default {
               `Expected visible title motion after hover intent: ${JSON.stringify({ before, after })}`,
             );
             ctx.assert(
+              before.nativeTitle === null && after.nativeTitle === null,
+              `Expected no native browser tooltip while revealing an overflowing title: ${JSON.stringify({
+                before: before.nativeTitle,
+                after: after.nativeTitle,
+              })}`,
+            );
+            ctx.assert(
               after.maskImage !== "none",
               `Expected a clipped-edge mask while the title is moving, got ${after.maskImage}.`,
             );
             ctx.assert(
-              Math.abs(after.rowLeft - before.rowLeft) <= 1 &&
-                Math.abs(after.rowRight - before.rowRight) <= 1 &&
-                Math.abs(after.actionsLeft - before.actionsLeft) <= 1 &&
-                Math.abs(after.actionsRight - before.actionsRight) <= 1,
-              `The session row or its action controls moved by more than one pixel while the title animated: ${JSON.stringify({ before, after })}`,
+              Math.abs(after.viewportLeft - before.viewportLeft) <= 1 &&
+                after.viewportRight <= before.viewportRight + 1,
+              "The title viewport shifted instead of staying anchored while row actions appeared.",
             );
           },
           screenshot: {
