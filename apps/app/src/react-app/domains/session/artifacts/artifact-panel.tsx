@@ -1,10 +1,11 @@
 /** @jsxImportSource react */
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Ellipsis, ExternalLink, FolderOpen, PanelLeftClose, PanelLeftOpen, X } from "lucide-react";
+import { lazy, Suspense, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertTriangle, Download, Ellipsis, ExternalLink, FolderOpen, PanelLeftClose, PanelLeftOpen, X } from "lucide-react";
 
-import type { OpenworkServerClient, OpenworkWorkspaceCatalogEntry } from "@/app/lib/openwork-server";
+import { OpenworkServerError, type OpenworkServerClient, type OpenworkWorkspaceCatalogEntry } from "@/app/lib/openwork-server";
 import { openDesktopPath, revealDesktopItemInDir } from "@/app/lib/desktop";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -16,6 +17,8 @@ import { toast } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { usePlatform } from "@/react-app/kernel/platform";
 import { type ArtifactPanelTab, usePanelTabStore } from "../panel/panel-tab-store";
+import { ArtifactAutosaveController } from "./artifact-autosave";
+import { serializeSpreadsheet, type SpreadsheetRows } from "./artifact-spreadsheet-model";
 import { isCollectibleArtifactTarget, openTargetFromWorkspaceFile, type BinaryData, type Data, type OpenTarget, type TextData } from "./open-target";
 import { HTMLPreview, ImagePreview, MarkdownPreview, PdfPreview, PlainText, PreviewError, PreviewLoading, PreviewUnavailable } from "./preview";
 
@@ -57,7 +60,19 @@ type ArtifactQueryState =
   | (TextData & { updatedAt: number | null })
   | (BinaryData & { contentType: string | null; updatedAt: number | null });
 
-type SaveArtifactInput = Data & { baseUpdatedAt: number | null };
+type SpreadsheetDraft = { kind: "spreadsheet"; rows: SpreadsheetRows };
+type ArtifactDraft = Data | SpreadsheetDraft;
+
+const autosaveControllers = new WeakMap<OpenworkServerClient, Map<string, ArtifactAutosaveController<ArtifactDraft>>>();
+const dirtyAutosaves = new Set<ArtifactAutosaveController<ArtifactDraft>>();
+
+function flushRetainedAutosaves() {
+  for (const autosave of dirtyAutosaves) autosave.flush();
+}
+
+function hasDirtyRetainedAutosave() {
+  return dirtyAutosaves.size > 0;
+}
 
 function absoluteWorkspacePath(root: string, path: string) {
   const cleanRoot = root.trim().replace(/[/\\]+$/, "");
@@ -68,6 +83,39 @@ function absoluteWorkspacePath(root: string, path: string) {
 
 function isTextContent(target: OpenTarget): boolean {
   return ["markdown", "code", "text", "sheet", "html"].includes(target.preview) && !/\.(xlsx|xls|ods)$/i.test(target.value);
+}
+
+function dataEquals(left: ArtifactDraft, right: ArtifactDraft) {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "spreadsheet" && right.kind === "spreadsheet") {
+    return left.rows.length === right.rows.length && left.rows.every((row, rowIndex) => {
+      const other = right.rows[rowIndex];
+      return other !== undefined && row.length === other.length && row.every((cell, columnIndex) => cell === other[columnIndex]);
+    });
+  }
+  if (left.kind === "text" && right.kind === "text") return left.data === right.data;
+  if (left.kind !== "binary" || right.kind !== "binary") return false;
+  if (left.data.byteLength !== right.data.byteLength) return false;
+  const leftBytes = new Uint8Array(left.data);
+  const rightBytes = new Uint8Array(right.data);
+  return leftBytes.every((value, index) => value === rightBytes[index]);
+}
+
+function isConflict(error: unknown) {
+  return error instanceof OpenworkServerError && error.status === 409;
+}
+
+function conflictUpdatedAt(error: unknown) {
+  if (!(error instanceof OpenworkServerError) || !error.details || typeof error.details !== "object") return null;
+  if (!("currentUpdatedAt" in error.details)) return null;
+  const value = error.details.currentUpdatedAt;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function editablePayload(data: ArtifactQueryState): ArtifactDraft {
+  return data.kind === "text"
+    ? { kind: "text", data: data.data }
+    : { kind: "binary", data: data.data };
 }
 
 export function ArtifactPanel({ sessionId, tab, client, workspaceId, workspaceRoot, isRemoteWorkspace = false, onClose }: ArtifactPanelProps) {
@@ -97,9 +145,6 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [treeOpen, setTreeOpen] = useState(true);
-  const [draft, setDraft] = useState("");
-  const lastSyncedRef = useRef<string | null>(null);
-  const failedDraftRef = useRef<string | null>(null);
   const isMermaidArtifact = target.kind === "file" && /\.mmd$/i.test(target.value);
   // Plain text opens directly in CodeMirror. Markdown and HTML default to
   // their rendered previews and retain the existing Edit toggle.
@@ -108,6 +153,7 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
   const canUseDesktopWorkspaceActions = !isRemoteWorkspace && platform.capabilities.revealInFileManager;
   const canUseDesktopFileActions = target.kind === "file" && canUseDesktopWorkspaceActions;
   const workspaceName = workspaceRoot.split(/[/\\]/).filter(Boolean).pop() ?? "Workspace";
+  const [reloading, setReloading] = useState(false);
 
   const openWorkspaceFile = (entry: { path: string; size: number; mtimeMs: number }) => {
     const nextTarget = openTargetFromWorkspaceFile(entry.path, { size: entry.size, updatedAt: entry.mtimeMs });
@@ -137,15 +183,77 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
         return { kind: "text", data: result.content, updatedAt: result.updatedAt ?? null };
       }
 
+      const before = await client.statWorkspaceFile(workspaceId, target.value);
       const result = await client.downloadWorkspaceFile(workspaceId, target.value);
+      const after = await client.statWorkspaceFile(workspaceId, target.value);
+      if (before.updatedAt !== after.updatedAt) {
+        throw new Error("The file changed while it was loading. Try again.");
+      }
 
-      return { kind: "binary", data: result.data, contentType: result.contentType, updatedAt: target.updatedAt ?? null };
+      return { kind: "binary", data: result.data, contentType: result.contentType, updatedAt: after.updatedAt ?? null };
     },
     refetchOnReconnect: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
     gcTime: 0,
   });
+
+  const autosave = useMemo(() => {
+    let controllers = autosaveControllers.get(client);
+    if (!controllers) {
+      controllers = new Map();
+      autosaveControllers.set(client, controllers);
+    }
+    const key = `${workspaceId}:${target.id}:${target.value}`;
+    const existing = controllers.get(key);
+    if (existing) return existing;
+
+    const queryKey = ["artifact-panel", workspaceId, target.id, target.updatedAt ?? null] as const;
+    const created = new ArtifactAutosaveController<ArtifactDraft>({
+      initialValue: isTextContent(target)
+        ? { kind: "text", data: "" }
+        : { kind: "binary", data: new ArrayBuffer(0) },
+      initialUpdatedAt: target.updatedAt ?? null,
+      equals: dataEquals,
+      isConflict,
+      write: async (payload, baseUpdatedAt) => {
+        if (target.kind !== "file") throw new Error("Cannot save non-file artifact.");
+        const serialized = payload.kind === "spreadsheet"
+          ? await serializeSpreadsheet(target.name, payload.rows)
+          : payload;
+        if (serialized.kind === "text") {
+          return client.writeWorkspaceFile(workspaceId, {
+            path: target.value,
+            content: serialized.data,
+            baseUpdatedAt,
+          });
+        }
+        return client.writeWorkspaceBinaryFile(workspaceId, {
+          path: target.value,
+          data: serialized.data,
+          baseUpdatedAt,
+        });
+      },
+      onSaved: (payload, result) => {
+        if (payload.kind === "spreadsheet") return;
+        queryClient.setQueryData<ArtifactQueryState>(queryKey, (current) => payload.kind === "text"
+          ? { kind: "text", data: payload.data, updatedAt: result.updatedAt }
+          : {
+              kind: "binary",
+              data: payload.data,
+              contentType: current?.kind === "binary" ? current.contentType : null,
+              updatedAt: result.updatedAt,
+            });
+      },
+    });
+    controllers.set(key, created);
+    created.subscribe(() => {
+      if (created.getSnapshot().dirty) dirtyAutosaves.add(created);
+      else dirtyAutosaves.delete(created);
+    });
+    return created;
+  }, [client, queryClient, target.id, target.kind, target.value, workspaceId]);
+  const autosaveState = useSyncExternalStore(autosave.subscribe, autosave.getSnapshot, autosave.getSnapshot);
 
   const [binaryObjectUrl, setBinaryObjectUrl] = useState<string | null>(null);
 
@@ -166,51 +274,35 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
 
   useEffect(() => {
     setEditing(false);
-    setDraft("");
-    lastSyncedRef.current = null;
-    failedDraftRef.current = null;
   }, [target.id, workspaceId]);
 
   useEffect(() => {
-    if (data?.kind === "text" && data.data !== lastSyncedRef.current) {
-      lastSyncedRef.current = data.data;
-      setDraft(data.data);
-    }
-  }, [data]);
+    if (!data) return;
+    autosave.acceptExternal(editablePayload(data), data.updatedAt);
+  }, [autosave, data]);
 
-  const { mutate, mutateAsync, isPending: isSaving } = useMutation({
-    mutationFn: async (input: SaveArtifactInput) => {
-      if (target.kind !== "file") {
-        throw new Error("Cannot save non-file artifact.");
-      }
+  useEffect(() => {
+    const flush = () => flushRetainedAutosaves();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      flush();
+      if (!hasDirtyRetainedAutosave()) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
 
-      if (input.kind === "text") {
-        return client.writeWorkspaceFile(workspaceId, { path: target.value, content: input.data, baseUpdatedAt: input.baseUpdatedAt });
-      }
-
-      return client.writeWorkspaceBinaryFile(workspaceId, { path: target.value, data: input.data, baseUpdatedAt: input.baseUpdatedAt });
-    },
-    onSuccess: (result, input) => {
-      queryClient.setQueryData<ArtifactQueryState>(
-        ["artifact-panel", workspaceId, target.id, target.updatedAt ?? null] as const,
-        input.kind === "text"
-          ? { kind: "text", data: input.data, updatedAt: result.updatedAt ?? null }
-          : { kind: "binary", data: input.data, contentType: data?.kind === "binary" ? data.contentType : null, updatedAt: result.updatedAt ?? null },
-      );
-
-      if (input.kind === "text") {
-        lastSyncedRef.current = input.data;
-        failedDraftRef.current = null;
-      }
-    },
-    onError: (cause, input) => {
-      if (input.kind === "text") {
-        failedDraftRef.current = input.data;
-      }
-
-      toast.error(cause instanceof Error ? cause.message : "Could not save changes.");
-    },
-  });
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      flush();
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [autosave]);
 
   const downloadFile = async (path: string, name: string) => {
     const result = await client.downloadWorkspaceFile(workspaceId, path);
@@ -270,38 +362,47 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
     await revealFile(target.value);
   };
 
-  const isTextEditing = data?.kind === "text" && (editing || isDirectTextEdit);
-  const isEditingSurface = data?.kind === "text" && (editing || isDirectTextEdit || isDirectCodeEdit);
-  const isDirty = data?.kind === "text" && draft !== data.data;
-
-  useEffect(() => {
-    if (
-      target.kind !== "file" ||
-      data?.kind !== "text" ||
-      !(editing || isDirectTextEdit || isDirectCodeEdit) ||
-      isSaving ||
-      draft === data.data ||
-      draft === failedDraftRef.current
-    ) {
-      return;
+  const reloadExternal = async () => {
+    if (target.kind !== "file") return;
+    setReloading(true);
+    try {
+      let next: ArtifactQueryState;
+      if (isTextContent(target)) {
+        const result = await client.readWorkspaceFile(workspaceId, target.value);
+        const after = await client.statWorkspaceFile(workspaceId, target.value);
+        if (result.updatedAt !== after.updatedAt) {
+          throw new Error("The file changed while it was reloading. Try again.");
+        }
+        next = { kind: "text", data: result.content, updatedAt: result.updatedAt };
+      } else {
+        const before = await client.statWorkspaceFile(workspaceId, target.value);
+        const result = await client.downloadWorkspaceFile(workspaceId, target.value);
+        const after = await client.statWorkspaceFile(workspaceId, target.value);
+        if (before.updatedAt !== after.updatedAt) {
+          throw new Error("The file changed while it was reloading. Try again.");
+        }
+        next = {
+          kind: "binary",
+          data: result.data,
+          contentType: result.contentType,
+          updatedAt: after.updatedAt ?? null,
+        };
+      }
+      autosave.applyReload(editablePayload(next), next.updatedAt);
+      queryClient.setQueryData(
+        ["artifact-panel", workspaceId, target.id, target.updatedAt ?? null] as const,
+        next,
+      );
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Could not reload this file.");
+    } finally {
+      setReloading(false);
     }
+  };
 
-    const timer = window.setTimeout(() => {
-      mutate({ kind: "text", data: draft, baseUpdatedAt: data.updatedAt });
-    }, 600);
-
-    return () => window.clearTimeout(timer);
-  }, [draft, data, editing, isDirectTextEdit, isDirectCodeEdit, isSaving, target.kind, mutate]);
-
-  const saveSpreadsheetContent = async (payload: Data) => {
-    if (target.kind !== "file") {
-      return;
-    }
-
-    await mutateAsync({
-      ...payload,
-      baseUpdatedAt: data?.kind === payload.kind ? data.updatedAt : target.updatedAt ?? null,
-    });
+  const close = () => {
+    autosave.flush();
+    onClose();
   };
 
   return (
@@ -323,15 +424,15 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
               {target.name}
             </h3>
             <span className="shrink-0 text-xs text-muted-foreground">
-              {target.exists === false ? "missing" : isEditingSurface ? (isSaving || isDirty ? "Saving\u2026" : "Saved") : ""}
+              {target.exists === false ? "missing" : autosaveState.ready ? (autosaveState.status === "saving" || autosaveState.dirty ? "Saving…" : "Saved") : ""}
             </span>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            {isTextContent(target) && data?.kind === "text" && !isDirectTextEdit && !isDirectCodeEdit ? (
+            {isTextContent(target) && autosaveState.ready && !isDirectTextEdit && !isDirectCodeEdit ? (
               <Tooltip>
                 <TooltipTrigger
                   render={(
-                    <Button variant="ghost" size="sm" onClick={() => setEditing((value) => !value)}>{editing ? "Done" : "Edit"}</Button>
+                    <Button variant="ghost" size="sm" onClick={() => { if (editing) autosave.flush(); setEditing((value) => !value); }}>{editing ? "Done" : "Edit"}</Button>
                   )}
                 />
                 <TooltipContent>{editing ? "Stop editing" : "Edit artifact"}</TooltipContent>
@@ -368,7 +469,7 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
             <Tooltip>
               <TooltipTrigger
                 render={(
-                  <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close artifact">
+                  <Button variant="ghost" size="icon-sm" onClick={close} aria-label="Close artifact">
                     <X />
                   </Button>
                 )}
@@ -378,6 +479,36 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
           </div>
         </div>
       </div>
+      {autosaveState.failure ? (
+        <div className="shrink-0 border-b border-border p-2">
+          <Alert variant="warning" className="rounded-lg py-2">
+            <AlertTriangle />
+            <AlertTitle>{autosaveState.failure === "conflict" ? "This file changed outside OpenWork" : "Changes could not be saved"}</AlertTitle>
+            <AlertDescription>
+              <p>
+                {autosaveState.failure === "conflict"
+                  ? "Review the external version, then reload it or retry with your newest edits."
+                  : autosaveState.error instanceof Error ? autosaveState.error.message : "Your newest edits are still here."}
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {autosaveState.failure === "conflict" ? (
+                  <Button variant="outline" size="xs" disabled={reloading || autosaveState.status === "saving"} onClick={() => void reloadExternal()}>
+                    {reloading ? "Reloading" : "Reload external version"}
+                  </Button>
+                ) : null}
+                <Button
+                  variant="default"
+                  size="xs"
+                  disabled={reloading || autosaveState.status === "saving"}
+                  onClick={() => autosave.retry(conflictUpdatedAt(autosaveState.error) ?? autosaveState.baseUpdatedAt)}
+                >
+                  {autosaveState.status === "saving" ? "Retrying" : "Retry newest changes"}
+                </Button>
+              </div>
+            </AlertDescription>
+          </Alert>
+        </div>
+      ) : null}
       <div className="flex min-h-0 flex-1 overflow-hidden">
         {treeOpen ? (
           <Suspense fallback={<div className="w-40 shrink-0 border-r border-border bg-muted/20" />}>
@@ -400,30 +531,32 @@ function ArtifactPanelView({ sessionId, client, workspaceId, workspaceRoot, isRe
           </Suspense>
         ) : null}
         <div className="min-w-0 flex-1 overflow-hidden">
-          {isLoading || (data?.kind === "binary" && !binaryObjectUrl) ? (
+          {(!autosaveState.ready && isLoading) || (target.preview !== "sheet" && data?.kind === "binary" && !binaryObjectUrl) ? (
           <PreviewLoading />
-        ) : isError ? (
+        ) : isError && !autosaveState.ready ? (
           <PreviewError message={error instanceof Error ? error.message : "Failed to load artifact" } />
-        ) : data?.kind === "text" && (editing || isDirectTextEdit) ? (
-          <TextEditor value={draft} language={target.preview === "markdown" ? "markdown" : "text"} onChange={setDraft} />
-        ) : target.preview === "markdown" && data?.kind === "text" ? (
-          <MarkdownPreview content={data.data} mermaidSource={isMermaidArtifact} />
-        ) : target.preview === "code" && data?.kind === "text" ? (
+        ) : autosaveState.value.kind === "text" && (editing || isDirectTextEdit) ? (
+          <TextEditor value={autosaveState.value.data} language={target.preview === "markdown" ? "markdown" : "text"} onChange={(value) => autosave.edit({ kind: "text", data: value })} />
+        ) : target.preview === "markdown" && autosaveState.value.kind === "text" ? (
+          <MarkdownPreview content={autosaveState.value.data} mermaidSource={isMermaidArtifact} />
+        ) : target.preview === "code" && autosaveState.value.kind === "text" ? (
           <Suspense fallback={<PreviewLoading />}>
             <ArtifactCodeView
               name={target.name}
               path={target.value}
-              content={data.data}
+              content={autosaveState.value.data}
               editable={isDirectCodeEdit}
-              onChange={setDraft}
+              onChange={(value) => autosave.edit({ kind: "text", data: value })}
             />
           </Suspense>
-        ) : target.preview === "sheet" ? (
+        ) : target.preview === "sheet" && autosaveState.ready ? (
           <SheetEditor
+            key={`${workspaceId}:${target.id}`}
             name={target.name}
-            content={data ?? { kind: "binary", data: new ArrayBuffer(0) }}
-            saving={isSaving}
-            onSave={saveSpreadsheetContent}
+            source={autosaveState.value.kind === "spreadsheet"
+              ? { kind: "rows", rows: autosaveState.value.rows }
+              : { kind: "content", content: autosaveState.value, revision: autosaveState.sourceRevision }}
+            onChange={(rows) => autosave.edit({ kind: "spreadsheet", rows })}
           />
         ) : target.preview === "html" && data?.kind === "text" ? (
           <HTMLPreview type="text" title={target.name} content={data.data} />
