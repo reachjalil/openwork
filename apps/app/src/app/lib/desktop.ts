@@ -38,6 +38,10 @@ import type {
   DesktopCommandInvokers,
   DesktopCommandName,
   DesktopCommandResult,
+  DesktopBinaryDownloadInput,
+  DesktopBinaryDownloadResult,
+  DesktopFetchResult,
+  DesktopMultipartUploadInput,
   EvalRelaunchResult,
   NukeManifestPreview,
   NukeOptions,
@@ -66,6 +70,9 @@ declare global {
         command: C,
         ...args: DesktopCommandArgs<C>
       ) => Promise<DesktopCommandResult<C>>;
+      fileSystem?: {
+        getPathForFile?: (file: File) => string;
+      };
       shell?: {
         openExternal?: (url: string) => Promise<{ ok: boolean; error?: string } | void>;
         relaunch?: () => Promise<void>;
@@ -272,6 +279,68 @@ function isLoopbackUrl(input: RequestInfo | URL): boolean {
   } catch {
     return false;
   }
+}
+
+function desktopTransferId(): string {
+  return crypto.randomUUID();
+}
+
+async function runCancellableDesktopTransfer<T>(
+  transferId: string,
+  signal: AbortSignal | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (signal?.aborted) throw signal.reason;
+  const cancel = () => {
+    void invokeElectronHelper("__cancelTransfer", transferId);
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    return await operation();
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+  }
+}
+
+export function electronPathForFile(file: File): string {
+  const getPathForFile = window.__OPENWORK_ELECTRON__?.fileSystem?.getPathForFile;
+  if (!getPathForFile) throw new Error("Electron file path access is unavailable.");
+  const filePath = getPathForFile(file).trim();
+  if (!filePath) throw new Error("This file does not have a local path and cannot be uploaded remotely.");
+  return filePath;
+}
+
+export async function desktopUploadMultipart(
+  file: File,
+  input: Omit<DesktopMultipartUploadInput, "transferId" | "filePath" | "filename" | "size" | "contentType">,
+  signal?: AbortSignal,
+): Promise<DesktopFetchResult> {
+  const transferId = desktopTransferId();
+  const payload: DesktopMultipartUploadInput = {
+    ...input,
+    transferId,
+    filePath: electronPathForFile(file),
+    filename: file.name,
+    size: file.size,
+    contentType: file.type || undefined,
+  };
+  return runCancellableDesktopTransfer(
+    transferId,
+    signal,
+    () => invokeElectronHelper("__uploadMultipart", payload),
+  );
+}
+
+export async function desktopDownloadBinary(
+  input: Omit<DesktopBinaryDownloadInput, "transferId">,
+  signal?: AbortSignal,
+): Promise<DesktopBinaryDownloadResult> {
+  const transferId = desktopTransferId();
+  return runCancellableDesktopTransfer(
+    transferId,
+    signal,
+    () => invokeElectronHelper("__downloadBinary", { ...input, transferId }),
+  );
 }
 
 type DesktopFetchMainOptions = {

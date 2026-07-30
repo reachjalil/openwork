@@ -1100,7 +1100,11 @@ export function ReactSessionComposer(props: ComposerProps) {
     // endpoint or provider) with their own errors instead of a composer rule.
     const accepted: File[] = [];
     for (const original of inputFiles) {
-      accepted.push(original.type.startsWith("image/") ? await compressImageFile(original) : original);
+      const needsLocalPath = props.isRemoteWorkspace
+        && Boolean(window.__OPENWORK_ELECTRON__?.fileSystem?.getPathForFile);
+      accepted.push(original.type.startsWith("image/") && !needsLocalPath
+        ? await compressImageFile(original)
+        : original);
     }
 
     if (accepted.length) {
