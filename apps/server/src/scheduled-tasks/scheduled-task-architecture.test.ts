@@ -147,13 +147,8 @@ test("the module delivers a manual run through an engine-neutral adapter", async
     expiresAt: null,
     grantor: "ignored-client-value",
   }, "owner");
-  const started = await module.service.runOnce(workspace.id, created.task.id);
-
-  let receipt = module.service.getRunReceipt(workspace.id, created.task.id, started.id);
-  for (let index = 0; index < 100 && receipt.run.status !== "completed"; index += 1) {
-    await Bun.sleep(1);
-    receipt = module.service.getRunReceipt(workspace.id, created.task.id, started.id);
-  }
+  const started = await module.runOnceAndWait(workspace.id, created.task.id);
+  const receipt = module.service.getRunReceipt(workspace.id, created.task.id, started.id);
   expect(receipt.run.status).toBe("completed");
   expect(receipt.run.sessionId).toBe(`ses_${started.id}`);
   expect(receipt.artifacts.map((artifact) => artifact.value)).toEqual([
@@ -161,4 +156,23 @@ test("the module delivers a manual run through an engine-neutral adapter", async
   ]);
   expect(await readFile(artifactPath, "utf8")).toContain("Manual Scheduled Tasks result");
   await module.stop();
+
+  const reopened = await createScheduledTasksModule({
+    config,
+    logger: { log() {} },
+    resolveWorkspace: async () => workspace,
+    createClient() {
+      throw new Error("OpenCode must not be instantiated by this test");
+    },
+    createExecutionAdapter: () => execution,
+  });
+  if (!reopened) throw new Error("Scheduled Tasks module did not reopen");
+  const durableReceipt = reopened.service.getRunReceipt(
+    workspace.id,
+    created.task.id,
+    started.id,
+  );
+  expect(durableReceipt.run.status).toBe("completed");
+  expect(durableReceipt.run.sessionId).toBe(`ses_${started.id}`);
+  await reopened.stop();
 });

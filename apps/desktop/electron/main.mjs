@@ -52,6 +52,8 @@ import { resolveConnectLinkPublicKeys } from "./connect-link-keys.mjs";
 import { openExternalUrl } from "./open-external.mjs";
 import { resolveAppIdentifier, resolveUserDataPath } from "./dev-profile.mjs";
 import { fetchAgentContextDiagnosticsResponse } from "./agent-context-diagnostics-fetch.mjs";
+import { parseScheduledTasksBackgroundArgs } from "./scheduled-tasks-background.mjs";
+import { createLaunchdScheduledTaskWakeAdapter } from "./scheduled-tasks-launchd.mjs";
 import {
   createLinuxDesktopIntegration,
 } from "./linux-desktop-integration.mjs";
@@ -101,6 +103,7 @@ const DESKTOP_DISTRIBUTION = resolveDesktopDistribution({
 });
 const TAURI_APP_IDENTIFIER = DESKTOP_DISTRIBUTION.appIdentifier;
 const DEV_APP_IDENTIFIER = `${DESKTOP_DISTRIBUTION.appIdentifier}.dev`;
+const initialScheduledTasksBackgroundRequest = parseScheduledTasksBackgroundArgs(process.argv);
 const DESKTOP_PROTOCOL_SCHEME = DESKTOP_DISTRIBUTION.protocolScheme;
 const APP_NAME =
   (!app.isPackaged ? process.env.OPENWORK_ELECTRON_APP_NAME?.trim() : "") ||
@@ -1146,10 +1149,19 @@ function validateSkillName(raw) {
   return trimmed;
 }
 
+const scheduledTaskWakeAdapter = createLaunchdScheduledTaskWakeAdapter({
+  platform: process.platform,
+  enabled: app.isPackaged,
+  executablePath: app.getPath("exe"),
+  profileId: "local-default",
+});
+
 const runtimeManager = createRuntimeManager({
   app,
   desktopRoot: path.resolve(__dirname, ".."),
   listLocalWorkspacePaths: () => workspaceStore.listLocalWorkspacePaths(),
+  scheduledTaskWakeAdapter,
+  reconcileScheduledTasksOnStart: !initialScheduledTasksBackgroundRequest,
 });
 
 let runtimeDisposedForQuit = false;
@@ -1279,6 +1291,20 @@ function ensureRuntimeBootstrap() {
     }));
   }
   return runtimeBootstrapPromise;
+}
+
+let scheduledTasksBackgroundQueue = Promise.resolve();
+
+function runScheduledTasksBackground(request) {
+  const pending = scheduledTasksBackgroundQueue.then(async () => {
+    const boot = await ensureRuntimeBootstrap();
+    if (!boot?.ok || boot.skipped) {
+      throw new Error(boot?.error || "No local workspace is available for Scheduled Tasks.");
+    }
+    return runtimeManager.runScheduledTasksBackground(request);
+  });
+  scheduledTasksBackgroundQueue = pending.catch(() => undefined);
+  return pending;
 }
 
 function resolveOpencodeConfigPath(scope, projectDir) {
@@ -2489,7 +2515,7 @@ const { ensureAutoUpdater } = registerUpdaterIpc({
 });
 
 if (!app.requestSingleInstanceLock()) {
-  if (isDevMode && !app.isPackaged) {
+  if (isDevMode && !app.isPackaged && !initialScheduledTasksBackgroundRequest) {
     console.error(`[openwork] Another OpenWork dev instance already holds this profile directory:
   ${app.getPath("userData")}
 The second process is exiting so its CDP port is released.
@@ -2510,6 +2536,13 @@ or use: pnpm dev:worktree`);
   });
 
   app.on("second-instance", async (_event, argv) => {
+    const backgroundRequest = parseScheduledTasksBackgroundArgs(argv);
+    if (backgroundRequest) {
+      await runScheduledTasksBackground(backgroundRequest).catch((error) => {
+        console.error("[scheduled-tasks] forwarded background wake failed", error);
+      });
+      return;
+    }
     const win = await createMainWindow();
     if (win.isMinimized()) {
       win.restore();
@@ -2531,6 +2564,27 @@ or use: pnpm dev:worktree`);
   });
 
   app.whenReady().then(async () => {
+    if (initialScheduledTasksBackgroundRequest) {
+      try {
+        await workspaceStore.migrateLegacyElectronWorkspaceStateIfNeeded();
+        const bootstrapConfig = await workspaceStore.getDesktopBootstrapConfig();
+        if (desktopActivationRequired(DESKTOP_DISTRIBUTION, bootstrapConfig)) {
+          throw new Error("OpenWork must be activated before Scheduled Tasks can run in the background.");
+        }
+        const result = await runScheduledTasksBackground(initialScheduledTasksBackgroundRequest);
+        console.info("[scheduled-tasks] background wake completed", {
+          mode: result.mode,
+          nextDueAt: result.nextDueAt,
+        });
+      } catch (error) {
+        process.exitCode = 1;
+        console.error("[scheduled-tasks] background wake failed", error);
+      } finally {
+        await disposeRuntimeBeforeQuit();
+        app.quit();
+      }
+      return;
+    }
     installMediaPermissionHandlers(session, () => mainWindow);
     await runPendingNukeCleanup({
       env: process.env,
