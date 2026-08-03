@@ -54,6 +54,7 @@ import { resolveAppIdentifier, resolveUserDataPath } from "./dev-profile.mjs";
 import { fetchAgentContextDiagnosticsResponse } from "./agent-context-diagnostics-fetch.mjs";
 import { parseScheduledTasksBackgroundArgs } from "./scheduled-tasks-background.mjs";
 import { createLaunchdScheduledTaskWakeAdapter } from "./scheduled-tasks-launchd.mjs";
+import { createWindowsScheduledTaskWakeAdapter } from "./scheduled-tasks-windows.mjs";
 import {
   createLinuxDesktopIntegration,
 } from "./linux-desktop-integration.mjs";
@@ -1149,12 +1150,19 @@ function validateSkillName(raw) {
   return trimmed;
 }
 
-const scheduledTaskWakeAdapter = createLaunchdScheduledTaskWakeAdapter({
-  platform: process.platform,
-  enabled: app.isPackaged,
-  executablePath: app.getPath("exe"),
-  profileId: "local-default",
-});
+const scheduledTaskWakeAdapter = process.platform === "win32"
+  ? createWindowsScheduledTaskWakeAdapter({
+      platform: process.platform,
+      enabled: app.isPackaged,
+      executablePath: app.getPath("exe"),
+      profileId: "local-default",
+    })
+  : createLaunchdScheduledTaskWakeAdapter({
+      platform: process.platform,
+      enabled: app.isPackaged,
+      executablePath: app.getPath("exe"),
+      profileId: "local-default",
+    });
 
 const runtimeManager = createRuntimeManager({
   app,
