@@ -1061,7 +1061,13 @@ export function mergeSystemCaChildEnv(baseEnv = {}, caEnv = {}, extra = {}) {
   };
 }
 
-export function createRuntimeManager({ app, desktopRoot, listLocalWorkspacePaths }) {
+export function createRuntimeManager({
+  app,
+  desktopRoot,
+  listLocalWorkspacePaths,
+  scheduledTaskWakeAdapter = null,
+  reconcileScheduledTasksOnStart = true,
+}) {
   const engineState = createEngineState();
   const openworkServerState = createOpenworkServerState();
 
@@ -1616,6 +1622,11 @@ export function createRuntimeManager({ app, desktopRoot, listLocalWorkspacePaths
       opencodeCwd: managedOpencodeWorkdir(),
     });
     inProcessServer = handle;
+    if (reconcileScheduledTasksOnStart) {
+      await scheduledTaskWakeAdapter?.reconcile({
+        nextDueAt: handle.scheduledTasks?.nextDueAt() ?? null,
+      });
+    }
     openworkServerState.managedOpencodeExecution = handle.managedOpencodeExecution ?? null;
     engineState.managedByServer = Boolean(handle.managedOpencode);
     engineState.managedPid = handle.managedOpencode?.pid ?? null;
@@ -1822,6 +1833,26 @@ export function createRuntimeManager({ app, desktopRoot, listLocalWorkspacePaths
     return snapshotOpenworkServerState(openworkServerState);
   }
 
+  async function runScheduledTasksBackground(request) {
+    const scheduledTasks = inProcessServer?.scheduledTasks;
+    if (!scheduledTasks) {
+      throw new Error("The local Scheduled Tasks runtime is unavailable.");
+    }
+    if (request?.mode === "run-once") {
+      const run = await scheduledTasks.runOnceAndWait(request.workspaceId, request.taskId);
+      const nextDueAt = scheduledTasks.nextDueAt();
+      await scheduledTaskWakeAdapter?.reconcile({ nextDueAt });
+      return { mode: "run-once", run, nextDueAt };
+    }
+    const tick = await scheduledTasks.tickAndWait({
+      now: Date.now(),
+      source: request?.source === "manual" ? "manual" : "os-wake",
+    });
+    const nextDueAt = scheduledTasks.nextDueAt();
+    await scheduledTaskWakeAdapter?.reconcile({ nextDueAt });
+    return { mode: "tick", tick, nextDueAt };
+  }
+
   async function openworkServerRestart(options = {}) {
     const workspacePaths = prioritizeWorkspacePaths(engineState.projectDir, await listLocalWorkspacePaths());
     const shouldManageOpencode = Boolean(
@@ -1919,12 +1950,21 @@ export function createRuntimeManager({ app, desktopRoot, listLocalWorkspacePaths
     engineStop: () => withRuntimeLifecycle(() => engineStop()),
     engineRestart: (options) => withRuntimeLifecycle(() => engineRestart(options)),
     prepareFreshRuntime: () => withRuntimeLifecycle(() => prepareFreshRuntime()),
-    dispose: () => withRuntimeLifecycle(() => stopAllRuntimeChildren()),
+    dispose: () => withRuntimeLifecycle(async () => {
+      if (inProcessServer?.scheduledTasks) {
+        await scheduledTaskWakeAdapter?.reconcile({
+          nextDueAt: inProcessServer.scheduledTasks.nextDueAt(),
+        });
+      }
+      await stopAllRuntimeChildren();
+      await scheduledTaskWakeAdapter?.stop();
+    }),
     runtimeStatus,
     engineInfo,
     engineDoctor,
     engineInstall,
     openworkServerInfo,
+    runScheduledTasksBackground,
     openworkServerRestart: (options) => withRuntimeLifecycle(() => openworkServerRestart(options)),
     opencodeMcpAuth,
     sandboxCleanupOpenworkContainers,

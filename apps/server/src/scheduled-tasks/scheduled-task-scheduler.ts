@@ -14,6 +14,7 @@ export interface CreateScheduledTaskSchedulerOptions {
 export interface ScheduledTaskScheduler extends ScheduledTaskTickPort {
   readonly running: boolean;
   start(options?: { immediate?: boolean }): void;
+  tickAndWait(input: ScheduledTaskTickInput): Promise<ScheduledTaskTickResult>;
   stop(): Promise<void>;
 }
 
@@ -60,6 +61,12 @@ export function createScheduledTaskScheduler(
     },
 
     tick,
+
+    async tickAndWait(input) {
+      const result = await tick(input);
+      await options.service.waitForIdle();
+      return result;
+    },
 
     async stop() {
       if (timer) {

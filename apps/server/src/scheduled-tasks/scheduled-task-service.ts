@@ -121,6 +121,8 @@ export interface ScheduledTaskService {
   cancelRun(workspaceId: string, taskId: string, runId: string): Promise<ScheduledTaskRun>;
   recoverInterruptedRuns(): { runIds: string[] };
   tick(input: ScheduledTaskTickInput): Promise<ScheduledTaskTickResult>;
+  /** Wait for every execution already claimed by this service to become terminal. */
+  waitForIdle(): Promise<void>;
   stop(reason?: CancellationReason): Promise<void>;
 }
 
@@ -1431,6 +1433,12 @@ export function createScheduledTaskService(
         claimedRunIds: claimed.map((run) => run.id),
         nextDueAt: store.nextDueAt(scope),
       };
+    },
+
+    async waitForIdle() {
+      while (inFlight.size > 0) {
+        await Promise.allSettled([...inFlight]);
+      }
     },
 
     async stop(reason = "shutdown") {

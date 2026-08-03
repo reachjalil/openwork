@@ -21,6 +21,8 @@ import { sweepLegacyOpenCodeConfig } from "./legacy-config-sweep.js";
 import { resolveOpencodeModelsUrl } from "./opencode-models-url.js";
 import type { ServeResult } from "./serve-node.js";
 import type { ServerConfig } from "./types.js";
+import type { ScheduledTaskRun } from "@openwork/types/scheduled-tasks";
+import type { ScheduledTaskTickInput, ScheduledTaskTickResult } from "@openwork/scheduled-tasks";
 
 export type EmbeddedServerOptions = CliArgs & {
   /** When true, spawn a managed OpenCode child process. */
@@ -42,6 +44,11 @@ export type EmbeddedServerHandle = {
   managedOpencodeExecution: OpencodeExecutionSnapshot | null;
   /** Liveness for the managed OpenCode child process, when spawned. */
   managedOpencode: { pid: number | null; isAlive: () => boolean } | null;
+  scheduledTasks: {
+    tickAndWait(input: ScheduledTaskTickInput): Promise<ScheduledTaskTickResult>;
+    runOnceAndWait(workspaceId: string, taskId: string): Promise<ScheduledTaskRun>;
+    nextDueAt(): number | null;
+  } | null;
   /** Stop the HTTP server and managed OpenCode (if any). */
   stop: () => Promise<void>;
 };
@@ -133,6 +140,7 @@ export async function startEmbeddedServer(options: EmbeddedServerOptions): Promi
     managedOpencode: managedOpencode
       ? { pid: managedOpencode.pid ?? null, isAlive: managedOpencode.isAlive }
       : null,
+    scheduledTasks: server.scheduledTasks,
     async stop() {
       if (managedOpencodeIdentity) {
         clearTrustedOpencodeProcess(config, managedOpencodeIdentity);
