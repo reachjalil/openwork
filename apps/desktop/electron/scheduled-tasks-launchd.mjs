@@ -3,7 +3,10 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { scheduledTasksBackgroundArgv } from "./scheduled-tasks-background.mjs";
+import {
+  normalizeScheduledTasksProfileId,
+  scheduledTasksBackgroundArgv,
+} from "./scheduled-tasks-background.mjs";
 
 const MINIMUM_INTERVAL_MS = 60_000;
 
@@ -14,14 +17,6 @@ function xml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
-}
-
-function normalizedProfileId(value) {
-  const profileId = String(value ?? "").trim();
-  if (!/^[a-z0-9][a-z0-9.-]{0,63}$/i.test(profileId)) {
-    throw new Error("Scheduled Tasks profile id must be opaque alphanumeric text.");
-  }
-  return profileId;
 }
 
 function calendarDate(nextDueAt) {
@@ -35,7 +30,7 @@ function calendarDate(nextDueAt) {
 }
 
 export function renderScheduledTasksLaunchdPlist(input) {
-  const profileId = normalizedProfileId(input.profileId);
+  const profileId = normalizeScheduledTasksProfileId(input.profileId);
   const executablePath = path.resolve(String(input.executablePath ?? ""));
   const appBundlePath = path.resolve(executablePath, "../../..");
   const wake = calendarDate(input.nextDueAt);
@@ -92,7 +87,7 @@ function defaultLaunchctl(args) {
 
 export function createLaunchdScheduledTaskWakeAdapter(options) {
   const platform = options.platform ?? process.platform;
-  const profileId = normalizedProfileId(options.profileId);
+  const profileId = normalizeScheduledTasksProfileId(options.profileId);
   const label = `com.differentai.openwork.scheduled-tasks.${profileId}`;
   const launchAgentsDir = options.launchAgentsDir
     ?? path.join(options.homeDir ?? os.homedir(), "Library", "LaunchAgents");

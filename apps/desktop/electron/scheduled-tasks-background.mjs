@@ -9,6 +9,14 @@ function argumentValue(argv, flag) {
   return String(argv[index + 1] ?? "").trim();
 }
 
+export function normalizeScheduledTasksProfileId(value) {
+  const profileId = String(value ?? "").trim();
+  if (!/^[a-z0-9][a-z0-9.-]{0,63}$/i.test(profileId)) {
+    throw new Error("Scheduled Tasks profile id must be opaque alphanumeric text.");
+  }
+  return profileId;
+}
+
 export function parseScheduledTasksBackgroundArgs(argv) {
   if (!Array.isArray(argv) || !argv.includes(BACKGROUND_FLAG)) return null;
   const profileId = argumentValue(argv, PROFILE_FLAG);
@@ -23,7 +31,6 @@ export function parseScheduledTasksBackgroundArgs(argv) {
 }
 
 export function scheduledTasksBackgroundArgv(profileId) {
-  const normalizedProfileId = String(profileId ?? "").trim();
-  if (!normalizedProfileId) throw new Error("Scheduled Tasks profile id is required.");
+  const normalizedProfileId = normalizeScheduledTasksProfileId(profileId);
   return [BACKGROUND_FLAG, PROFILE_FLAG, normalizedProfileId];
 }
