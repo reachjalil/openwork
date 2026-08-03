@@ -840,7 +840,14 @@ function isSessionCommandProxyRequest(method: string, proxyPath: string) {
   return method === "POST" && /^\/session\/[^/]+\/command$/.test(normalizeOpencodeProxyPath(proxyPath));
 }
 
-export async function startServer(config: ServerConfig): Promise<ServeResult> {
+export type OpenworkServerHandle = ServeResult & {
+  scheduledTasks: Pick<
+    ScheduledTasksModule,
+    "tickAndWait" | "runOnceAndWait" | "nextDueAt"
+  > | null;
+};
+
+export async function startServer(config: ServerConfig): Promise<OpenworkServerHandle> {
   const approvals = new ApprovalService(config.approval);
   const reloadEvents = new ReloadEventStore();
   const tokens = new TokenService(config);
@@ -1065,6 +1072,13 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
 
   return {
     ...server,
+    scheduledTasks: scheduledTasks
+      ? {
+          tickAndWait: scheduledTasks.tickAndWait,
+          runOnceAndWait: scheduledTasks.runOnceAndWait,
+          nextDueAt: scheduledTasks.nextDueAt,
+        }
+      : null,
     stop: async () => {
       invalidateEngineMcpServerState(config, engineMcpServerState);
       watcherHandle.close();
