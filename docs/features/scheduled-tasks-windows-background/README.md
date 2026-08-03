@@ -11,9 +11,9 @@ OpenWork executable with an opaque profile identifier at the earliest due time.
 
 ## Layering
 
-- Parent proposal: `different-ai/openwork#3236`
+- Parent proposal: `different-ai/openwork#3236` at `a0248a606`
 - Portable runtime extraction: `7352171ea`
-- Required local-background base: `114287fbb`
+- Required local-background base: `5186df5c8`
 - This branch adds only the Windows wake adapter, its integration, tests, and
   proof instructions.
 
