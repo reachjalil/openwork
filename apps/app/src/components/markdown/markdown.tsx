@@ -17,6 +17,7 @@ import {
   renderHighlightedMarkdownHtml,
   renderMarkdownHtml,
   setCodeCopyButtonState,
+  setCodeWrapButtonState,
   syncMarkdownImagePreviews,
 } from "./markdown-primitive";
 import { LinkActionMenu } from "./link-action-menu";
@@ -101,6 +102,7 @@ function MarkdownBlockInner({
 }: MarkdownBlockInnerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const codeCopyResetTimers = useRef(new Map<HTMLButtonElement, number>());
+  const codeWrapStates = useRef(new Map<number, boolean>());
   const { openTargets, onOpenTarget } = useOpenTargets();
   const [linkMenu, setLinkMenu] = useState<{ target: OpenTarget; rect: DOMRect } | null>(null);
   const [imagePreview, setImagePreview] = useState<{ src: string; alt: string } | null>(null);
@@ -129,6 +131,22 @@ function MarkdownBlockInner({
     }, CODE_COPY_RESET_DELAY_MS);
     codeCopyResetTimers.current.set(button, resetTimer);
   }, []);
+
+  const syncCodeWrapStates = useCallback(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    for (const [index, codeBlock] of root.querySelectorAll("[data-openwork-code-block]").entries()) {
+      const button = codeBlock.querySelector("[data-openwork-code-wrap]");
+      if (button instanceof HTMLButtonElement) {
+        setCodeWrapButtonState(button, codeWrapStates.current.get(index) ?? false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    codeWrapStates.current.clear();
+  }, [text]);
 
   useEffect(() => {
     const timers = codeCopyResetTimers.current;
@@ -182,6 +200,7 @@ function MarkdownBlockInner({
       }
 
       applyTextHighlights(root, highlightQuery ?? "");
+      syncCodeWrapStates();
     });
   });
 
@@ -208,6 +227,22 @@ function MarkdownBlockInner({
         const codeBlock = copyButton.closest("[data-openwork-code-block]");
         const code = codeBlock?.querySelector("code");
         void handleCodeBlockCopy(copyButton, code?.textContent ?? "");
+        return;
+      }
+
+      const wrapButton = event.target.closest("[data-openwork-code-wrap]");
+      if (wrapButton instanceof HTMLButtonElement) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const codeBlock = wrapButton.closest("[data-openwork-code-block]");
+        const codeBlocks = Array.from(root.querySelectorAll("[data-openwork-code-block]"));
+        const index = codeBlock ? codeBlocks.indexOf(codeBlock) : -1;
+        if (index >= 0) {
+          const wrapped = !(codeWrapStates.current.get(index) ?? false);
+          codeWrapStates.current.set(index, wrapped);
+          setCodeWrapButtonState(wrapButton, wrapped);
+        }
         return;
       }
 
