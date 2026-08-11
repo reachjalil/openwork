@@ -11,19 +11,17 @@ import { expect } from "vitest";
 const expectation =
 	"The signed-in OpenWork Web workspace shell is visible and ready for a task";
 const appSpecsEnabled = process.env.OPENWORK_EVAL_APP_SPECS === "1";
-const localPlacement =
-	process.env.OPENWORK_EVAL_DAYTONA !== "1" &&
-	!process.env.OPENWORK_EVAL_DEN_API_URL?.trim();
-const mysqlOpen = await localMysqlIsRunning();
+const daytonaPlacement = process.env.OPENWORK_EVAL_DAYTONA === "1";
+const attachedDen = Boolean(process.env.OPENWORK_EVAL_DEN_API_URL?.trim());
+const mysqlOpen =
+	daytonaPlacement || attachedDen || (await localMysqlIsRunning());
 const title = !appSpecsEnabled
 	? "hosted browser app boot skipped — needs: set OPENWORK_EVAL_APP_SPECS=1"
-	: !localPlacement
-		? "hosted browser app boot skipped — needs local placement without OPENWORK_EVAL_DEN_API_URL"
-		: !mysqlOpen
-			? "hosted browser app boot skipped — needs MySQL on 127.0.0.1:3306"
-			: "hosted browser app boot records the signed-in OpenWork Web workspace shell";
+	: !mysqlOpen
+		? "hosted browser app boot skipped — needs MySQL on 127.0.0.1:3306 for local placement"
+		: "hosted browser app boot records the signed-in OpenWork Web workspace shell";
 
-test.skipIf(!appSpecsEnabled || !localPlacement || !mysqlOpen)(
+test.skipIf(!appSpecsEnabled || !mysqlOpen)(
 	title,
 	async ({ evidence, place }) => {
 		needs({ optIn: ["OPENWORK_EVAL_APP_SPECS"] });
