@@ -605,13 +605,16 @@ export async function ensureDenOrgMode(orgMode: DenOrgMode | undefined, log: (me
 }
 
 async function ensureDenWeb(log: (message: string) => void, orgMode?: DenOrgMode): Promise<void> {
-  if (await httpOk(`${DEN_WEB_ORIGIN}/api/den/health`)) {
-    log(`den-web already healthy at ${DEN_WEB_ORIGIN}`);
-    return;
-  }
-
   const webUrl = new URL(DEN_WEB_ORIGIN);
   const denWebPort = webUrl.port || "3005";
+  if (await httpOk(`${DEN_WEB_ORIGIN}/api/den/health`)) {
+    // Proof retries can reuse a Daytona workspace after the candidate has
+    // changed. A healthy Next.js process may still serve the prior checkout's
+    // route graph, so restart it before proving the exact current candidate.
+    log(`Restarting den-web at ${DEN_WEB_ORIGIN} for the exact candidate...`);
+    await stopRecordedProcess("den-web.pid", "den-web", log);
+    await freePorts([Number(denWebPort)], log, "exact candidate restart");
+  }
   // Reusable Daytona images may retain a generated Next.js route manifest
   // from an older checkout. Dependencies remain cached, but generated app
   // output must match the exact candidate being proved.

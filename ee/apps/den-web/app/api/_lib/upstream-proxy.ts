@@ -17,6 +17,9 @@ const HOP_BY_HOP_HEADERS = new Set([
 const REQUEST_ONLY_HEADERS = new Set(["host", "content-length"]);
 const RESPONSE_ONLY_HEADERS = new Set(["content-length", "content-encoding"]);
 const SPOOFABLE_FORWARDING_HEADERS = new Set(["forwarded", "x-forwarded-host", "x-forwarded-prefix", "x-forwarded-proto"]);
+// Covers the existing 20 MiB Gmail attachment flow after base64/JSON overhead;
+// individual upload endpoints keep enforcing their narrower limits downstream.
+const DEFAULT_REQUEST_BODY_MAX_BYTES = 32 * 1024 * 1024;
 
 /**
  * OpenWork Cloud instances are served from Daytona preview origins that are
@@ -79,6 +82,7 @@ type ProxyOptions = {
   routePrefix: string;
   upstreamPathPrefix?: string;
   rewriteAuthLocationsToRequestOrigin?: boolean;
+  maxRequestBodyBytes?: number;
 };
 
 function requestPublicOrigin(request: NextRequest): URL {
@@ -242,9 +246,96 @@ function errorName(error: unknown): string {
   return error instanceof Error ? error.name : typeof error;
 }
 
-async function readRequestBody(request: NextRequest): Promise<Uint8Array | null> {
-  if (request.method === "GET" || request.method === "HEAD") return null;
-  return new Uint8Array(await request.arrayBuffer());
+type DeclaredBodySize = {
+  bytes?: number;
+  exceedsLimit: boolean;
+};
+
+type RequestBodyReadResult =
+  | { ok: true; body: Uint8Array | null; observedBytes?: number }
+  | { ok: false; observedBytes: number };
+
+function requestBodyMaxBytes(options: ProxyOptions): number {
+  const maxBytes = options.maxRequestBodyBytes ?? DEFAULT_REQUEST_BODY_MAX_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new RangeError("maxRequestBodyBytes must be a non-negative safe integer.");
+  }
+  return maxBytes;
+}
+
+function declaredRequestBodySize(request: NextRequest, maxBytes: number): DeclaredBodySize {
+  if (request.method === "GET" || request.method === "HEAD") return { exceedsLimit: false };
+  const header = request.headers.get("content-length")?.trim();
+  if (!header || !/^\d+$/.test(header)) return { exceedsLimit: false };
+
+  const normalized = header.replace(/^0+/, "") || "0";
+  const limit = String(maxBytes);
+  const exceedsLimit = normalized.length > limit.length
+    || (normalized.length === limit.length && normalized > limit);
+  const bytes = Number(normalized);
+  return Number.isSafeInteger(bytes) ? { bytes, exceedsLimit } : { exceedsLimit };
+}
+
+async function readRequestBody(request: NextRequest, maxBytes: number): Promise<RequestBodyReadResult> {
+  if (request.method === "GET" || request.method === "HEAD") return { ok: true, body: null };
+  if (!request.body) return { ok: true, body: null, observedBytes: 0 };
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let observedBytes = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      observedBytes += chunk.value.byteLength;
+      if (observedBytes > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The 413 response does not depend on the request producer accepting cancellation.
+        }
+        return { ok: false, observedBytes };
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(observedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, body, observedBytes };
+}
+
+function requestId(request: NextRequest): string {
+  return request.headers.get("x-request-id")?.trim() || crypto.randomUUID();
+}
+
+function requestTooLargeResponse(input: {
+  request: NextRequest;
+  maxBytes: number;
+  instanceOrigin: string | null;
+  declaredBytes?: number;
+  observedBytes?: number;
+}): Response {
+  const id = requestId(input.request);
+  const headers = new Headers({
+    "content-type": "application/json",
+    "x-request-id": id,
+  });
+  if (input.instanceOrigin) applyCloudInstanceCorsHeaders(headers, input.instanceOrigin);
+
+  return new Response(JSON.stringify({
+    error: "request_too_large",
+    requestId: id,
+    maxBytes: input.maxBytes,
+    ...(input.declaredBytes === undefined ? {} : { declaredBytes: input.declaredBytes }),
+    ...(input.observedBytes === undefined ? {} : { observedBytes: input.observedBytes }),
+  }), { status: 413, headers });
 }
 
 export async function proxyUpstream(
@@ -283,6 +374,43 @@ export async function proxyUpstream(
     return new Response(null, { status: 204, headers: preflight });
   }
 
+  const maxBytes = requestBodyMaxBytes(options);
+  const declaredSize = declaredRequestBodySize(request, maxBytes);
+  if (declaredSize.exceedsLimit) {
+    denWebLogger.warn("den-web upstream proxy rejected request body", {
+      route_prefix: options.routePrefix,
+      method: request.method,
+      status: 413,
+      max_bytes: maxBytes,
+      ...(declaredSize.bytes === undefined ? {} : { declared_bytes: declaredSize.bytes }),
+      duration_ms: elapsedMs(startedAtMs),
+    });
+    return requestTooLargeResponse({
+      request,
+      maxBytes,
+      instanceOrigin,
+      declaredBytes: declaredSize.bytes,
+    });
+  }
+
+  const bodyRead = await readRequestBody(request, maxBytes);
+  if (!bodyRead.ok) {
+    denWebLogger.warn("den-web upstream proxy rejected request body", {
+      route_prefix: options.routePrefix,
+      method: request.method,
+      status: 413,
+      max_bytes: maxBytes,
+      observed_bytes: bodyRead.observedBytes,
+      duration_ms: elapsedMs(startedAtMs),
+    });
+    return requestTooLargeResponse({
+      request,
+      maxBytes,
+      instanceOrigin,
+      observedBytes: bodyRead.observedBytes,
+    });
+  }
+
   const targetPath = getTargetPath(request, segments, options.routePrefix);
   const targetUrl = buildTargetUrl(apiBase, request, targetPath, options.upstreamPathPrefix);
   let upstream: Response;
@@ -290,7 +418,7 @@ export async function proxyUpstream(
     upstream = await fetch(targetUrl, {
       method: request.method,
       headers: await cloneRequestHeaders(request, options.routePrefix, instanceOrigin !== null),
-      body: await readRequestBody(request),
+      body: bodyRead.body,
       redirect: "manual",
     });
   } catch (error) {
@@ -311,6 +439,8 @@ export async function proxyUpstream(
     upstream_origin: upstreamOrigin(apiBase),
     upstream_path: `/${[normalizePathPrefix(options.upstreamPathPrefix ?? ""), targetPath].filter(Boolean).join("/")}`,
     status: upstream.status,
+    ...(declaredSize.bytes === undefined ? {} : { declared_bytes: declaredSize.bytes }),
+    ...(bodyRead.observedBytes === undefined ? {} : { observed_bytes: bodyRead.observedBytes }),
     duration_ms: elapsedMs(startedAtMs),
   });
 

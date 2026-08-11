@@ -11,10 +11,16 @@ const READ_TITLE = `(() => {
   if (!(title instanceof HTMLElement)) return null;
   const viewport = title.parentElement;
   if (!(viewport instanceof HTMLElement)) return null;
+  const title = viewport.querySelector('span[aria-hidden="true"]');
+  if (!(title instanceof HTMLElement)) return null;
+  const actions = row.querySelector('[data-session-hover-actions]');
+  if (!(actions instanceof HTMLElement)) return null;
   const titleStyle = getComputedStyle(title);
   const viewportStyle = getComputedStyle(viewport);
   const titleRect = title.getBoundingClientRect();
   const viewportRect = viewport.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  const actionsRect = actions.getBoundingClientRect();
   return {
     left: titleRect.left,
     top: titleRect.top,
@@ -30,6 +36,10 @@ const READ_TITLE = `(() => {
     overflow: viewportStyle.overflow,
     viewportLeft: viewportRect.left,
     viewportRight: viewportRect.right,
+    rowLeft: rowRect.left,
+    rowRight: rowRect.right,
+    actionsLeft: actionsRect.left,
+    actionsRight: actionsRect.right,
   };
 })()`;
 
@@ -49,12 +59,16 @@ export default {
           return match ? decodeURIComponent(match[1]) : null;
         })()`, { timeoutMs: 30_000, label: "created session" });
         await ctx.control("session.rename", { sessionId, title: LONG_TITLE });
-        await ctx.waitFor(`${READ_TITLE}?.scrollWidth > ${READ_TITLE}?.clientWidth`, {
-          timeoutMs: 30_000,
-          label: "overflowing session title",
-        });
+        const titleState = readTitle(sessionId);
+        await ctx.waitFor(
+          `${titleState}?.scrollWidth > ${titleState}?.clientWidth`,
+          {
+            timeoutMs: 30_000,
+            label: "overflowing session title",
+          },
+        );
 
-        const before = await ctx.eval(READ_TITLE);
+        const before = await ctx.eval(titleState);
         ctx.assert(before, "Could not measure the overflowing title.");
         await ctx.client.send("Input.dispatchMouseEvent", {
           type: "mouseMoved",
@@ -66,7 +80,7 @@ export default {
         await ctx.prove("A genuinely overflowing title reveals more text only after hover intent without a competing browser tooltip", {
           action: async () => {},
           assert: async () => {
-            const after = await ctx.eval(READ_TITLE);
+            const after = await ctx.eval(titleState);
             ctx.assert(after, "Could not measure the title after hover.");
             ctx.assert(
               after.animationName !== "none" ||

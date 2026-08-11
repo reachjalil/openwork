@@ -94,6 +94,23 @@ async function activateDifferentVisibleSession(ctx, modifier) {
   }
 }
 
+async function dispatchKey(ctx, payload) {
+  let timeout;
+  try {
+    await Promise.race([
+      ctx.client.send("Input.dispatchKeyEvent", payload),
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`Timed out dispatching ${payload.type} for ${payload.key}`)),
+          10_000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export default {
   id: "sidebar-session-number-shortcuts",
   title: "Platform-modifier number shortcuts match visible session order",
@@ -118,6 +135,10 @@ export default {
         const modifier = {
           key: isMac ? "Meta" : "Control",
           code: isMac ? "MetaLeft" : "ControlLeft",
+        };
+        await dispatchKey(ctx, {
+          type: "keyDown",
+          ...modifier,
           modifiers: isMac ? 4 : 2,
         };
         await dispatchKey(ctx, {
