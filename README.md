@@ -90,6 +90,14 @@ Versions released before this license was adopted remain under their original li
 
 [Read the OpenWork docs.](https://openworklabs.com/docs)
 
+### Report a documentation issue
+
+If you find unclear or incorrect documentation, [open an issue](https://github.com/reachjalil/openwork/issues/new/choose) and include:
+
+- The affected page or file
+- The wording you expected
+- The wording you observed
+
 ## Local development
 
 For one checkout, keep using `pnpm dev`; with no extra environment variables it reuses the existing shared dev profile.
