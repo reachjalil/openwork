@@ -33,13 +33,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
-import {
   Dialog,
   DialogClose,
   DialogContent,
@@ -102,6 +95,13 @@ import {
 import { useWorkbenchStore, type WorkbenchSessionTab } from "./workbench-store";
 import { isSameWorkbenchSession } from "./workbench-store";
 import { ReactSessionRuntime } from "../sync/runtime-sync";
+import {
+  availableNarrowPane,
+  NarrowPaneSwitcher,
+  shouldShowNarrowPaneSwitcher,
+  type NarrowPaneOption,
+  type NarrowSessionPane,
+} from "./responsive-session-layout";
 
 const STARTUP_SKELETON_ROWS = [
   { id: "intro", titleWidth: "42%", bodyWidth: "88%" },
@@ -492,7 +492,11 @@ export function SessionPage(props: SessionPageProps) {
   const workbenchTabs = useWorkbenchStore((state) => state.tabs);
   const workbenchSecondary = useWorkbenchStore((state) => state.secondary);
   const focusedWorkbenchPane = useWorkbenchStore((state) => state.focusedPane);
-  const activeWorkbenchPane = isMobile ? "primary" : focusedWorkbenchPane;
+  const [narrowPane, setNarrowPane] = useState<NarrowSessionPane>("chat");
+  const narrowPaneNavigationRef = useRef<HTMLElement>(null);
+  const activeWorkbenchPane = isMobile
+    ? narrowPane === "split" ? "secondary" : "primary"
+    : focusedWorkbenchPane;
   const syncWorkbench = useWorkbenchStore((state) => state.sync);
   const openWorkbenchTab = useWorkbenchStore((state) => state.openTab);
   const setWorkbenchSplit = useWorkbenchStore((state) => state.setSplit);
@@ -512,6 +516,25 @@ export function SessionPage(props: SessionPageProps) {
   const [createGroupWorkspaceId, setCreateGroupWorkspaceId] = useState<string | null>(null);
   const browserPanelRef = usePanelRef();
   const preserveSidePanelOnPanelOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    setNarrowPane((current) => availableNarrowPane(current, Boolean(splitSession), sidePanelOpen));
+  }, [isMobile, sidePanelOpen, splitSession]);
+
+  useEffect(() => {
+    if (isMobile && sidePanelOpen) setNarrowPane("panel");
+  }, [isMobile, sidePanelOpen]);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    const frame = window.requestAnimationFrame(() => {
+      narrowPaneNavigationRef.current
+        ?.querySelector<HTMLElement>("[role='tab'][aria-selected='true']")
+        ?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isMobile, narrowPane]);
 
   const setCurrentSidePanel = useCallback((panel: SidePanelItem | null) => {
     setSidePanelState(GLOBAL_VOICE_SIDE_PANEL_KEY, panel === "voice" ? "voice" : null);
@@ -993,7 +1016,7 @@ export function SessionPage(props: SessionPageProps) {
       reactSessionToken &&
       props.surface,
   );
-  const canRenderSplitSurface = Boolean(!isMobile && canRenderReactSurface && splitSession);
+  const canRenderSplitSurface = Boolean(canRenderReactSurface && splitSession);
   const splitWorkspaceTitle = splitSession
     ? splitSession.workspaceTitle ?? workspaceTitleForId(props.sidebar.workspaceSessionGroups, splitSession.workspaceId)
     : "";
@@ -1035,6 +1058,26 @@ export function SessionPage(props: SessionPageProps) {
       message: selectedWorkspaceErrorMessage || "This workspace is disconnected.",
     };
   })();
+  const narrowPaneOptions = useMemo<NarrowPaneOption[]>(() => {
+    const options: NarrowPaneOption[] = [{ id: "chat", label: "Chat" }];
+    if (splitSession) options.push({ id: "split", label: "Split chat" });
+    if (sidePanelOpen) {
+      options.push({
+        id: "panel",
+        label: activeSidePanel === "voice"
+          ? "Voice"
+          : activeSidePanel === "extensions"
+            ? "Extensions"
+            : "Tools",
+      });
+    }
+    return options;
+  }, [activeSidePanel, sidePanelOpen, splitSession]);
+  const showNarrowPaneSwitcher = shouldShowNarrowPaneSwitcher(
+    isMobile,
+    Boolean(splitSession),
+    sidePanelOpen,
+  );
   const crossWorkspaceSplit = Boolean(splitSession && splitSession.workspaceId !== props.selectedWorkspaceId);
   // Route-level refreshes must only gate the very first paint of a session.
   // Once the surface can mount it owns its own data stream, so replacing a
@@ -1234,6 +1277,30 @@ export function SessionPage(props: SessionPageProps) {
       setDeleteBusy(false);
     }
   };
+
+  const sidePanelContent = activeSidePanel === "extensions" && props.settingsSlot ? (
+    <div className="flex h-full min-h-0 flex-col overflow-y-auto bg-background">
+      {props.settingsSlot}
+    </div>
+  ) : activeSidePanel === "voice" ? (
+    <VoicePanel
+      client={props.openworkServerClient}
+      workspaceId={props.runtimeWorkspaceId}
+      sessionId={props.selectedSessionId}
+      onClose={closeRightPane}
+    />
+  ) : activeSidePanel === "panel" ? (
+    <SidePanel
+      sessionId={sidePanelSessionKey}
+      client={props.openworkServerClient}
+      workspaceId={props.runtimeWorkspaceId}
+      workspaceRoot={props.selectedWorkspaceRoot}
+      isRemoteWorkspace={props.surface?.isRemoteWorkspace ?? false}
+      onClose={closeRightPane}
+      onOpenExtensions={props.settingsSlot ? () => setCurrentSidePanel("extensions") : undefined}
+      onOpenVoice={voiceExtensionEnabled ? openVoiceRailPane : undefined}
+    />
+  ) : null;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[radial-gradient(circle_at_top,rgba(74,111,255,0.12),transparent_42%),var(--app-bg,#0b1020)] text-dls-text max-lg:pt-[env(safe-area-inset-top)] mac:bg-transparent">
@@ -1487,7 +1554,30 @@ export function SessionPage(props: SessionPageProps) {
             </div>
           </header>
 
-          <ResizablePanelGroup orientation="vertical" className="min-h-0 flex-1 overflow-hidden">
+          {showNarrowPaneSwitcher ? (
+            <NarrowPaneSwitcher
+              activePane={narrowPane}
+              options={narrowPaneOptions}
+              navigationRef={narrowPaneNavigationRef}
+              onSelect={setNarrowPane}
+            />
+          ) : null}
+
+          {isMobile && narrowPane === "panel" && sidePanelOpen ? (
+            <div
+              id="narrow-session-pane-panel"
+              role="tabpanel"
+              className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-dls-surface"
+            >
+              {sidePanelContent}
+            </div>
+          ) : (
+          <ResizablePanelGroup
+            id={`narrow-session-pane-${narrowPane}`}
+            role={showNarrowPaneSwitcher ? "tabpanel" : undefined}
+            orientation="vertical"
+            className="min-h-0 flex-1 overflow-hidden"
+          >
             <ResizablePanel minSize="180px" className="min-h-0">
             <div className="relative h-full min-w-0 overflow-hidden bg-dls-surface mac:bg-dls-surface/85 mac:backdrop-blur-2xl mac:backdrop-saturate-150">
               {props.primarySlot ? (
@@ -1557,15 +1647,16 @@ export function SessionPage(props: SessionPageProps) {
                     orientation="horizontal"
                     className="min-h-0 flex-1"
                   >
-                    <ResizablePanel
-                      minSize={isMobile ? "0px" : "320px"}
-                      className="min-h-0 min-w-0"
-                      data-workbench-pane="primary"
-                      data-workbench-workspace-id={props.selectedWorkspaceId}
-                      data-workbench-pane-focused={activeWorkbenchPane === "primary" ? "true" : undefined}
-                      onPointerDown={() => focusWorkbenchPane("primary")}
-                      onFocusCapture={() => focusWorkbenchPane("primary")}
-                    >
+                    {!isMobile || narrowPane === "chat" ? (
+                      <ResizablePanel
+                        minSize={isMobile ? "0px" : "320px"}
+                        className="min-h-0 min-w-0"
+                        data-workbench-pane="primary"
+                        data-workbench-workspace-id={props.selectedWorkspaceId}
+                        data-workbench-pane-focused={activeWorkbenchPane === "primary" ? "true" : undefined}
+                        onPointerDown={() => focusWorkbenchPane("primary")}
+                        onFocusCapture={() => focusWorkbenchPane("primary")}
+                      >
                       <div className="flex h-full min-h-0 flex-col">
                         {canRenderSplitSurface && workbenchPrimary ? (
                           <WorkbenchPaneHeader
@@ -1607,10 +1698,11 @@ export function SessionPage(props: SessionPageProps) {
                           />
                         </div>
                       </div>
-                    </ResizablePanel>
-                    {canRenderSplitSurface && splitSession && splitPaneRuntime ? (
+                      </ResizablePanel>
+                    ) : null}
+                    {canRenderSplitSurface && splitSession && splitPaneRuntime && (!isMobile || narrowPane === "split") ? (
                       <>
-                        <ResizableHandle />
+                        {!isMobile ? <ResizableHandle /> : null}
                         <ResizablePanel
                           minSize="320px"
                           className="min-h-0 min-w-0"
@@ -1771,6 +1863,7 @@ export function SessionPage(props: SessionPageProps) {
               </>
             ) : null}
           </ResizablePanelGroup>
+          )}
 
               </main>
             </ResizablePanel>
@@ -1785,75 +1878,10 @@ export function SessionPage(props: SessionPageProps) {
                   className="min-h-0 overflow-hidden pl-2 lg:flex lg:flex-col"
                 >
                   <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-[14px] border border-border bg-dls-surface shadow-[0_8px_24px_rgba(15,23,42,0.06)] dark:shadow-[0_10px_30px_rgba(0,0,0,0.45)] mac:bg-dls-surface/85 mac:backdrop-blur-2xl mac:backdrop-saturate-150">
-                  {activeSidePanel === "extensions" && props.settingsSlot ? (
-                    <div className="flex h-full min-h-0 flex-col overflow-y-auto bg-background">
-                      {props.settingsSlot}
-                    </div>
-                  ) : activeSidePanel === "voice" ? (
-                    <VoicePanel
-                      client={props.openworkServerClient}
-                      workspaceId={props.runtimeWorkspaceId}
-                      sessionId={props.selectedSessionId}
-                      onClose={closeRightPane}
-                    />
-                  ) : activeSidePanel === "panel" ? (
-                    <SidePanel
-                      sessionId={sidePanelSessionKey}
-                      client={props.openworkServerClient}
-                      workspaceId={props.runtimeWorkspaceId}
-                      workspaceRoot={props.selectedWorkspaceRoot}
-                      isRemoteWorkspace={props.surface?.isRemoteWorkspace ?? false}
-                      onClose={closeRightPane}
-                      onOpenExtensions={props.settingsSlot ? () => setCurrentSidePanel("extensions") : undefined}
-                      onOpenVoice={voiceExtensionEnabled ? openVoiceRailPane : undefined}
-                    />
-                  ) : null}
+                    {sidePanelContent}
                   </div>
                 </ResizablePanel>
               </>
-            ) : null}
-            {isMobile ? (
-              <Sheet
-                open={sidePanelOpen}
-                onOpenChange={(open) => {
-                  if (!open) closeRightPane();
-                }}
-              >
-                <SheetContent
-                  side="bottom"
-                  className="h-[min(88dvh,100dvh)] max-h-[88dvh] p-0 pb-[env(safe-area-inset-bottom)]"
-                >
-                  <SheetHeader className="sr-only">
-                    <SheetTitle>Session panel</SheetTitle>
-                    <SheetDescription>Artifacts, files, and session tools</SheetDescription>
-                  </SheetHeader>
-                  <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-dls-surface">
-                    {activeSidePanel === "extensions" && props.settingsSlot ? (
-                      <div className="flex h-full min-h-0 flex-col overflow-y-auto bg-background">
-                        {props.settingsSlot}
-                      </div>
-                    ) : activeSidePanel === "voice" ? (
-                      <VoicePanel
-                        client={props.openworkServerClient}
-                        workspaceId={props.runtimeWorkspaceId}
-                        sessionId={props.selectedSessionId}
-                        onClose={closeRightPane}
-                      />
-                    ) : activeSidePanel === "panel" ? (
-                      <SidePanel
-                        sessionId={sidePanelSessionKey}
-                        client={props.openworkServerClient}
-                        workspaceId={props.runtimeWorkspaceId}
-                        workspaceRoot={props.selectedWorkspaceRoot}
-                        isRemoteWorkspace={props.surface?.isRemoteWorkspace ?? false}
-                        onClose={closeRightPane}
-                        onOpenExtensions={props.settingsSlot ? () => setCurrentSidePanel("extensions") : undefined}
-                        onOpenVoice={voiceExtensionEnabled ? openVoiceRailPane : undefined}
-                      />
-                    ) : null}
-                  </div>
-                </SheetContent>
-              </Sheet>
             ) : null}
           </ResizablePanelGroup>
           <aside className="hidden w-9 shrink-0 flex-col items-center gap-1 px-0.5 py-2 text-muted-foreground lg:flex mac:titlebar-no-drag">
