@@ -14,6 +14,8 @@ import {
   type OpencodeSessionErrorPresentation,
 } from "./session-error";
 
+const snapshotUIMessagesCache = new WeakMap<OpenworkSessionSnapshot, UIMessage[]>();
+
 function sessionErrorMessageId(turnKey: string) {
   return `${SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX}${turnKey}`;
 }
@@ -121,7 +123,10 @@ function mapSnapshotToolParts(part: ToolPart): UIMessage["parts"] {
 }
 
 export function snapshotToUIMessages(snapshot: OpenworkSessionSnapshot): UIMessage[] {
-  return snapshot.messages.flatMap((message) => {
+  const cached = snapshotUIMessagesCache.get(snapshot);
+  if (cached) return cached;
+
+  const messages = snapshot.messages.flatMap((message) => {
     const created = message.info.time?.created;
     const time = message.info.time;
     const completed = time && "completed" in time ? time.completed : undefined;
@@ -182,4 +187,6 @@ export function snapshotToUIMessages(snapshot: OpenworkSessionSnapshot): UIMessa
     const errorMessage = createSessionErrorUIMessage(message.info.id, presentOpencodeSessionError(error), { created });
     return uiMessage.parts.length > 0 ? [uiMessage, errorMessage] : [errorMessage];
   });
+  snapshotUIMessagesCache.set(snapshot, messages);
+  return messages;
 }

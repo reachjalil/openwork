@@ -106,9 +106,45 @@ function sortFullyTimestampedMessages(messages: UIMessage[]) {
   const withCreated = messages.map((message, index) => ({ message, index, created: messageCreated(message) }));
   if (withCreated.some((item) => item.created === null)) return messages;
 
-  return withCreated
+  const sorted = withCreated
     .sort((a, b) => (a.created ?? 0) - (b.created ?? 0) || a.index - b.index)
     .map((item) => item.message);
+  return sorted.every((message, index) => message === messages[index]) ? messages : sorted;
+}
+
+function appendMessagesByChronology(messages: UIMessage[], additions: UIMessage[], sourceOrder: UIMessage[]) {
+  if (additions.length === 0) return sortFullyTimestampedMessages(messages);
+
+  const combined = [...messages, ...additions];
+  const created = combined.map(messageCreated);
+  if (
+    created.every((value) => value !== null) &&
+    new Set(created).size === created.length
+  ) {
+    // Current OpenCode messages normally carry a creation time. Batch the tail
+    // merge and sort once instead of repeatedly scanning and splicing a
+    // growing transcript for every cached-only message.
+    return sortFullyTimestampedMessages(combined);
+  }
+
+  // Older OpenCode shapes can omit timestamps, and millisecond timestamps can
+  // collide. Keep the source-order fallback for ambiguous snapshots so
+  // reconnect remains lossless across engine versions.
+  const merged = messages.slice();
+  for (const addition of additions) insertMessageByChronology(merged, addition, sourceOrder);
+  return sortFullyTimestampedMessages(merged);
+}
+
+function reuseMatchingMessageList(messages: UIMessage[], candidates: UIMessage[][]) {
+  for (const candidate of candidates) {
+    if (
+      candidate.length === messages.length &&
+      candidate.every((message, index) => message === messages[index])
+    ) {
+      return candidate;
+    }
+  }
+  return messages;
 }
 
 export function messageListContainsAll(container: UIMessage[], required: UIMessage[]) {
@@ -132,36 +168,35 @@ export function mergeSnapshotAndLiveMessages(
     return liveMessage ? mergeSnapshotMessageWithCached(snapshotMessage, liveMessage) : snapshotMessage;
   });
 
+  let ordered = merged;
   if (options.appendLiveOnlyMessages) {
-    for (const liveMessage of liveMessages) {
-      if (!snapshotIds.has(liveMessage.id)) insertMessageByChronology(merged, liveMessage, liveMessages);
-    }
+    const liveOnly = liveMessages.filter((message) => !snapshotIds.has(message.id));
+    ordered = appendMessagesByChronology(merged, liveOnly, liveMessages);
+  } else {
+    ordered = sortFullyTimestampedMessages(merged);
   }
 
-  return sortFullyTimestampedMessages(merged);
+  return reuseMatchingMessageList(ordered, [liveMessages, snapshotMessages]);
 }
 
 export function mergeSnapshotIntoCachedMessages(snapshotMessages: UIMessage[], cachedMessages: UIMessage[]) {
   if (snapshotMessages.length === 0) return cachedMessages;
   if (cachedMessages.length === 0) return snapshotMessages;
 
-  const snapshotById = new Map(snapshotMessages.map((message) => [message.id, message]));
   const cachedById = new Map(cachedMessages.map((message) => [message.id, message]));
   const seen = new Set<string>();
   const merged = snapshotMessages.map((message) => {
     seen.add(message.id);
-    const snapshotMessage = snapshotById.get(message.id);
     const cachedMessage = cachedById.get(message.id);
-    return snapshotMessage && cachedMessage
-      ? mergeSnapshotMessageWithCached(snapshotMessage, cachedMessage)
+    return cachedMessage
+      ? mergeSnapshotMessageWithCached(message, cachedMessage)
       : message;
   });
 
-  for (const message of cachedMessages) {
-    if (seen.has(message.id)) continue;
-    seen.add(message.id);
-    insertMessageByChronology(merged, message, cachedMessages);
-  }
+  const cachedOnly = cachedMessages.filter((message) => !seen.has(message.id));
+  const ordered = appendMessagesByChronology(merged, cachedOnly, cachedMessages);
 
-  return sortFullyTimestampedMessages(merged);
+  // Returning the canonical array on an unchanged rehydrate prevents a
+  // no-op React Query cache write from notifying every transcript observer.
+  return reuseMatchingMessageList(ordered, [cachedMessages, snapshotMessages]);
 }
