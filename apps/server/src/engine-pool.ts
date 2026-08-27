@@ -66,6 +66,8 @@ export type EnginePoolHooks = {
   now?: () => number;
   schedule?: (operation: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   waitForHealthy?: (handle: ManagedOpencodeServer) => Promise<void>;
+  /** Inactivity budget for a draining session. Primarily injectable for focused tests. */
+  drainTimeoutMs?: number;
   logger?: EnginePoolLogger;
 };
 
@@ -89,6 +91,9 @@ type Generation = {
   trustedIdentity: string | null;
   drainTimer: ReturnType<typeof setInterval> | null;
   drainDeadline: number | null;
+  drainProgressAt: Map<string, number>;
+  interruptedSessions: Set<string>;
+  drainTickInFlight: boolean;
 };
 
 export type EnginePoolSnapshot = {
@@ -137,8 +142,8 @@ function nonNegativeIntFromEnv(name: string, fallback: number): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
 }
 
-/** How long a draining engine may keep running before its sessions are aborted. */
-function drainTimeoutMs(): number {
+/** How long a draining session may go without authoritative progress. */
+function defaultDrainTimeoutMs(): number {
   return positiveIntFromEnv("OPENWORK_ENGINE_DRAIN_TIMEOUT_MS", 15 * 60_000);
 }
 
@@ -279,6 +284,28 @@ function eventIdentifiers(payload: unknown): { sessionIds: Set<string>; requestI
   return { sessionIds, requestIds };
 }
 
+const AUTHORITATIVE_PROGRESS_EVENTS = new Set([
+  "message.updated",
+  "message.part.updated",
+  "message.part.delta",
+  "session.diff",
+  "todo.updated",
+  "session.status",
+  "session.compacted",
+]);
+
+function isAuthoritativeProgressEvent(payload: unknown): boolean {
+  if (!isRecord(payload) || typeof payload.type !== "string") return false;
+  const syncEvent = payload.type === "sync" && isRecord(payload.syncEvent)
+    ? payload.syncEvent
+    : null;
+  const rawType = syncEvent && typeof syncEvent.type === "string"
+    ? syncEvent.type
+    : payload.type;
+  const type = rawType.replace(/\.\d+$/, "");
+  return AUTHORITATIVE_PROGRESS_EVENTS.has(type) || type.startsWith("session.next.");
+}
+
 /**
  * Everything a spawned engine reads at build time. Comparing this is what
  * lets a repeated no-op reload skip spawning a replacement.
@@ -298,6 +325,7 @@ export class EnginePool {
   private readonly config: ServerConfig;
   private readonly template: EngineSpawnTemplate;
   private readonly hooks: EnginePoolHooks;
+  private readonly drainInactivityTimeoutMs: number;
   private generations: Generation[] = [];
   private inFlight: Promise<RolloverOutcome> | null = null;
   private pendingRollover: {
@@ -325,6 +353,12 @@ export class EnginePool {
     this.config = input.config;
     this.template = input.template;
     this.hooks = input.hooks;
+    const injectedDrainTimeout = input.hooks.drainTimeoutMs;
+    this.drainInactivityTimeoutMs = injectedDrainTimeout !== undefined
+      && Number.isFinite(injectedDrainTimeout)
+      && injectedDrainTimeout > 0
+      ? injectedDrainTimeout
+      : defaultDrainTimeoutMs();
   }
 
   /**
@@ -347,6 +381,9 @@ export class EnginePool {
       trustedIdentity: input.trustedIdentity,
       drainTimer: null,
       drainDeadline: null,
+      drainProgressAt: new Map(),
+      interruptedSessions: new Set(),
+      drainTickInFlight: false,
     });
     this.lastSpawnAt = Date.now();
   }
@@ -445,7 +482,12 @@ export class EnginePool {
     if (!generation) return false;
     const identifiers = eventIdentifiers(payload);
     if (generation.status === "draining") {
-      const ownedSession = [...identifiers.sessionIds].some((id) => this.sessionOwnership.get(id) === generation.id);
+      const ownedSessionIds = [...identifiers.sessionIds]
+        .filter((id) => this.sessionOwnership.get(id) === generation.id);
+      const ownedSession = ownedSessionIds.length > 0;
+      if (ownedSession && isAuthoritativeProgressEvent(payload)) {
+        for (const sessionId of ownedSessionIds) this.recordDrainProgress(generation, sessionId);
+      }
       if (ownedSession) {
         for (const requestId of identifiers.requestIds) this.pinnedRequests.set(requestId, generation.id);
       }
@@ -636,6 +678,9 @@ export class EnginePool {
       trustedIdentity: null,
       drainTimer: null,
       drainDeadline: null,
+      drainProgressAt: new Map(),
+      interruptedSessions: new Set(),
+      drainTickInFlight: false,
     };
     this.generations.push(generation);
 
@@ -683,7 +728,7 @@ export class EnginePool {
     // config; this pushes the runtime-DB MCPs a fresh instance cannot see.
     this.detachPostRefreshSync(workspace);
 
-    if (primary) this.startDrainMonitor(primary, workspace);
+    if (primary) this.startDrainMonitor(primary);
 
     return { action: "rolled_over", generationId: generation.id, drainingSessions: drainingSessions.length };
   }
@@ -746,29 +791,54 @@ export class EnginePool {
   }
 
   /**
-   * Watch a draining engine and close it once its runs finish. Past the grace
-   * window the remaining sessions are aborted rather than kept alive forever.
+   * Watch a draining engine and close it once its runs finish. Each active
+   * session gets an inactivity budget that authoritative engine progress can
+   * refresh. A merely repeated busy status is not progress, so wedged work is
+   * still interrupted and retired in bounded time.
    */
-  private startDrainMonitor(generation: Generation, workspace: WorkspaceInfo): void {
-    generation.drainDeadline = Date.now() + drainTimeoutMs();
+  private startDrainMonitor(generation: Generation): void {
+    const startedAt = this.now();
+    for (const sessionId of this.activeSessionsByGeneration.get(generation.id) ?? []) {
+      generation.drainProgressAt.set(sessionId, startedAt);
+    }
+    this.updateDrainDeadline(generation);
     const tick = async (): Promise<void> => {
-      if (generation.status !== "draining") return;
-      const remaining = await this.nonIdleSessionIds(generation);
-      this.updateActiveSessions(generation, remaining);
-      if (remaining.length === 0) {
-        await this.retire(generation, "idle");
-        return;
-      }
-      if (generation.drainDeadline !== null && Date.now() >= generation.drainDeadline) {
-        this.hooks.logger?.log("warn", "Engine drain exceeded its grace period; aborting the remaining sessions.", {
-          "engine.drain.sessions": remaining.join(","),
-          "engine.drain.session_count": remaining.length,
+      if (generation.status !== "draining" || generation.drainTickInFlight) return;
+      generation.drainTickInFlight = true;
+      try {
+        const remaining = await this.nonIdleSessionIds(generation);
+        this.updateActiveSessions(generation, remaining);
+        if (remaining.length === 0) {
+          await this.retire(generation, "idle");
+          return;
+        }
+        if (remaining.every((sessionId) => generation.interruptedSessions.has(sessionId))) {
+          await this.retire(generation, "forced");
+          return;
+        }
+        const now = this.now();
+        const stale = remaining.filter((sessionId) => {
+          if (generation.interruptedSessions.has(sessionId)) return false;
+          const progressAt = generation.drainProgressAt.get(sessionId);
+          return progressAt !== undefined && now - progressAt >= this.drainInactivityTimeoutMs;
         });
-        for (const sessionId of remaining) {
+        if (stale.length === 0) return;
+        this.hooks.logger?.log("warn", "Engine drain found stalled sessions; interrupting them so they can be resumed.", {
+          "engine.drain.sessions": stale.join(","),
+          "engine.drain.session_count": stale.length,
+          "engine.drain.interruption_recoverable": true,
+        });
+        for (const sessionId of stale) {
+          generation.interruptedSessions.add(sessionId);
           await this.abortSession(generation, sessionId).catch(() => undefined);
         }
+        this.updateDrainDeadline(generation);
         await new Promise((resolve) => setTimeout(resolve, abortSettleMs()));
-        await this.retire(generation, "forced");
+        if (remaining.every((sessionId) => generation.interruptedSessions.has(sessionId))) {
+          await this.retire(generation, "forced");
+        }
+      } finally {
+        generation.drainTickInFlight = false;
       }
     };
     const timer = setInterval(() => void tick().catch(() => undefined), drainPollIntervalMs());
@@ -786,6 +856,8 @@ export class EnginePool {
       generation.drainTimer = null;
     }
     generation.drainDeadline = null;
+    generation.drainProgressAt.clear();
+    generation.interruptedSessions.clear();
     this.activeSessionsByGeneration.delete(generation.id);
     for (const [sessionId, generationId] of this.sessionOwnership) {
       if (generationId === generation.id) this.sessionOwnership.delete(sessionId);
@@ -917,6 +989,9 @@ export class EnginePool {
         trustedIdentity: null,
         drainTimer: null,
         drainDeadline: null,
+        drainProgressAt: new Map(),
+        interruptedSessions: new Set(),
+        drainTickInFlight: false,
       };
       this.generations.push(generation);
       if (handle.pid) {
@@ -1089,11 +1164,36 @@ export class EnginePool {
 
   private updateActiveSessions(generation: Generation, sessionIds: string[]): void {
     const next = new Set(sessionIds);
+    const now = this.now();
+    for (const sessionId of next) {
+      if (!generation.drainProgressAt.has(sessionId)) generation.drainProgressAt.set(sessionId, now);
+    }
+    for (const sessionId of generation.drainProgressAt.keys()) {
+      if (!next.has(sessionId)) generation.drainProgressAt.delete(sessionId);
+    }
+    for (const sessionId of generation.interruptedSessions) {
+      if (!next.has(sessionId)) generation.interruptedSessions.delete(sessionId);
+    }
     this.activeSessionsByGeneration.set(generation.id, next);
     for (const [sessionId, generationId] of this.sessionOwnership) {
       if (generationId === generation.id && !next.has(sessionId)) this.sessionOwnership.delete(sessionId);
     }
     for (const sessionId of next) this.sessionOwnership.set(sessionId, generation.id);
+    this.updateDrainDeadline(generation);
+  }
+
+  private recordDrainProgress(generation: Generation, sessionId: string): void {
+    if (generation.interruptedSessions.has(sessionId)) return;
+    if (this.activeSessionsByGeneration.get(generation.id)?.has(sessionId) !== true) return;
+    generation.drainProgressAt.set(sessionId, this.now());
+    this.updateDrainDeadline(generation);
+  }
+
+  private updateDrainDeadline(generation: Generation): void {
+    const deadlines = [...generation.drainProgressAt]
+      .filter(([sessionId]) => !generation.interruptedSessions.has(sessionId))
+      .map(([, progressAt]) => progressAt + this.drainInactivityTimeoutMs);
+    generation.drainDeadline = deadlines.length > 0 ? Math.min(...deadlines) : null;
   }
 
   private connectionFor(generation: Generation & { status: "primary" | "draining" }): EnginePoolConnection {
@@ -1119,29 +1219,38 @@ export class EnginePool {
   }
 
   private async abortSession(generation: Generation, sessionId: string): Promise<void> {
-    this.hooks.logger?.log("info", "Aborting OpenCode session from engine pool.", {
+    this.hooks.logger?.log("info", "Interrupting a stalled OpenCode task; completed output is preserved and the task can be resumed.", {
       "abort.source": "engine_pool.drain_timeout",
       "abort.initiator": "system",
-      "abort.reason": "draining engine exceeded grace period",
+      "abort.reason": "draining engine stopped making progress",
+      "interruption.recoverable": true,
+      "interruption.recovery": "resume_session",
       "session.id": sessionId,
       "engine.generation_id": generation.id,
     });
     try {
-      await loopbackFetch(new URL(`/session/${encodeURIComponent(sessionId)}/abort`, generation.handle.url).toString(), {
+      const response = await loopbackFetch(new URL(`/session/${encodeURIComponent(sessionId)}/abort`, generation.handle.url).toString(), {
         method: "POST",
         headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
         signal: AbortSignal.timeout(5_000),
       });
-      this.hooks.logger?.log("info", "OpenCode session abort from engine pool completed.", {
+      if (!response.ok) throw new Error(`OpenCode abort returned HTTP ${response.status}`);
+      // OpenCode persists MessageAbortedError for this endpoint. The renderer
+      // already presents that durable error with a Resume action.
+      this.hooks.logger?.log("info", "OpenCode recorded the recoverable task interruption.", {
         "abort.source": "engine_pool.drain_timeout",
         "abort.initiator": "system",
+        "interruption.recoverable": true,
+        "interruption.recovery": "resume_session",
         "session.id": sessionId,
         "engine.generation_id": generation.id,
       });
     } catch (error) {
-      this.hooks.logger?.log("error", "OpenCode session abort from engine pool failed.", {
+      this.hooks.logger?.log("error", "OpenCode could not persist the task interruption; emitting recoverable interruption diagnostics before retirement.", {
         "abort.source": "engine_pool.drain_timeout",
         "abort.initiator": "system",
+        "interruption.recoverable": true,
+        "interruption.recovery": "resume_session",
         "session.id": sessionId,
         "engine.generation_id": generation.id,
         "error.message": error instanceof Error ? error.message : String(error),

@@ -67,6 +67,12 @@ async function writeFakeEngineBin(root: string): Promise<string> {
     "    return value[directory ?? ''] ?? [];",
     "  } catch { return []; }",
     "};",
+    "const statusUnavailable = (port) => {",
+    "  try {",
+    "    const state = JSON.parse(readFileSync(statePath, 'utf8'));",
+    "    return Array.isArray(state.unreachable) && state.unreachable.includes(port);",
+    "  } catch { return false; }",
+    "};",
     "const server = Bun.serve({",
     "  hostname: '127.0.0.1',",
     "  port: requestedPort,",
@@ -74,6 +80,7 @@ async function writeFakeEngineBin(root: string): Promise<string> {
     "    const url = new URL(request.url);",
     "    append(`${server.port} ${request.method} ${url.pathname}`);",
     "    if (url.pathname === '/session/status') {",
+    "      if (statusUnavailable(server.port)) return Response.json({ error: 'unavailable' }, { status: 503 });",
     "      const entries = busySessions(server.port, url.searchParams.get('directory')).map((id) => [id, { type: 'busy' }]);",
     "      return Response.json(Object.fromEntries(entries));",
     "    }",
@@ -126,9 +133,15 @@ type Fixture = {
   statePath: string;
   logPath: string;
   hookCalls: { reloadInPlace: number; postRefreshSync: number };
+  hookLogs: Array<{
+    level: "info" | "warn" | "error";
+    message: string;
+    attributes: Record<string, unknown> | undefined;
+  }>;
   hooks: EnginePoolHooks;
   setBusy: (port: number, sessionIds: string[]) => Promise<void>;
   setBusyForDirectory: (port: number, directory: string, sessionIds: string[]) => Promise<void>;
+  setStatusUnavailable: (port: number, unavailable: boolean) => Promise<void>;
   logLines: () => Promise<string[]>;
   setRuntimeConfig: (content: string) => Promise<void>;
   spawnPrimary: () => Promise<ManagedOpencodeServer>;
@@ -197,6 +210,7 @@ async function createFixture(options?: { bin?: "ready" | "unready" }): Promise<F
   };
 
   const hookCalls = { reloadInPlace: 0, postRefreshSync: 0 };
+  const hookLogs: Fixture["hookLogs"] = [];
   const hooks: EnginePoolHooks = {
     reloadInPlace: async () => { hookCalls.reloadInPlace += 1; },
     engineBusy: async () => {
@@ -207,6 +221,11 @@ async function createFixture(options?: { bin?: "ready" | "unready" }): Promise<F
     writeRuntimeConfigFile: async () => ({ path: runtimeConfigPath }),
     registerTrusted: () => undefined,
     clearTrusted: () => undefined,
+    logger: {
+      log: (level, message, attributes) => {
+        hookLogs.push({ level, message, attributes });
+      },
+    },
   };
 
   const setBusy = async (port: number, sessionIds: string[]): Promise<void> => {
@@ -227,6 +246,17 @@ async function createFixture(options?: { bin?: "ready" | "unready" }): Promise<F
     await writeFile(statePath, JSON.stringify(state));
   };
 
+  const setStatusUnavailable = async (port: number, unavailable: boolean): Promise<void> => {
+    const state = JSON.parse(await readFile(statePath, "utf8").catch(() => "{}")) as Record<string, unknown>;
+    const unreachable = Array.isArray(state.unreachable)
+      ? state.unreachable.filter((value) => typeof value === "number")
+      : [];
+    state.unreachable = unavailable
+      ? [...new Set([...unreachable, port])]
+      : unreachable.filter((value) => value !== port);
+    await writeFile(statePath, JSON.stringify(state));
+  };
+
   const spawnPrimary = async (): Promise<ManagedOpencodeServer> => {
     const handle = await createManagedOpencodeServer({ bin, cwd: root, env: template.env });
     cleanups.push(() => handle.close().catch(() => undefined));
@@ -241,9 +271,11 @@ async function createFixture(options?: { bin?: "ready" | "unready" }): Promise<F
     statePath,
     logPath,
     hookCalls,
+    hookLogs,
     hooks,
     setBusy,
     setBusyForDirectory,
+    setStatusUnavailable,
     logLines: async () => (await readFile(logPath, "utf8").catch(() => "")).split("\n").filter(Boolean),
     setRuntimeConfig: (content: string) => writeFile(runtimeConfigPath, content),
     spawnPrimary,
@@ -693,24 +725,115 @@ describe("engine pool", () => {
     expect(closed).toBe(true);
   });
 
-  test("aborts the remaining sessions once the drain grace period expires", async () => {
-    setEnv("OPENWORK_ENGINE_DRAIN_TIMEOUT_MS", "300");
-    setEnv("OPENWORK_ENGINE_ABORT_SETTLE_MS", "100");
+  test("keeps a task draining past its deadline while authoritative progress continues", async () => {
+    setEnv("OPENWORK_ENGINE_ABORT_SETTLE_MS", "25");
     const fixture = await createFixture();
+    fixture.hooks.drainTimeoutMs = 250;
     const { pool, primary } = await createPool(fixture);
     const oldPort = portOf(primary.url);
-    // This session never finishes, so only the grace timeout can end the drain.
+    await fixture.setBusy(oldPort, ["ses_progressing", "ses_stuck"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+    const draining = pool.connections().find((connection) => connection.role === "draining");
+    if (!draining) throw new Error("expected a draining generation");
+
+    // This takes more than twice the injected inactivity budget. Real output
+    // events keep only the progressing session alive; repeated busy polls do
+    // not protect its wedged sibling.
+    for (let index = 0; index < 4; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const progressEvent = index % 2 === 0
+        ? {
+            type: "message.part.delta",
+            properties: {
+              sessionID: "ses_progressing",
+              messageID: "msg_progressing",
+              partID: "part_progressing",
+              delta: String(index),
+            },
+          }
+        : {
+            type: "sync",
+            syncEvent: {
+              type: "session.next.tool.progress.1",
+              data: {
+                sessionID: "ses_progressing",
+                callID: "call_progressing",
+              },
+            },
+          };
+      expect(pool.shouldForwardEvent(draining.generationId, progressEvent)).toBe(true);
+      expect(primary.isAlive()).toBe(true);
+    }
+
+    expect(await waitUntil(
+      async () => (await fixture.logLines()).includes(`${oldPort} POST /session/ses_stuck/abort`),
+      2_000,
+    )).toBe(true);
+    expect(await fixture.logLines()).not.toContain(`${oldPort} POST /session/ses_progressing/abort`);
+    expect(fixture.hookLogs.some((entry) =>
+      entry.attributes?.["session.id"] === "ses_stuck"
+      && entry.attributes["interruption.recoverable"] === true
+      && entry.attributes["interruption.recovery"] === "resume_session"
+    )).toBe(true);
+
+    // The legitimate long task completes normally after rollover. Retirement
+    // stays bounded even if the interrupted sibling keeps reporting busy.
+    await fixture.setBusy(oldPort, ["ses_stuck"]);
+    expect(await waitUntil(() => !primary.isAlive(), 5_000)).toBe(true);
+    expect(pool.snapshot().generations).toEqual([expect.objectContaining({ role: "primary" })]);
+  });
+
+  test("interrupts and retires a wedged draining generation within the injected bound", async () => {
+    setEnv("OPENWORK_ENGINE_ABORT_SETTLE_MS", "25");
+    const fixture = await createFixture();
+    fixture.hooks.drainTimeoutMs = 250;
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
     await fixture.setBusy(oldPort, ["ses_stuck"]);
     await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
 
     expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
       .toBe("rolled_over");
 
-    expect(await waitUntil(() => !primary.isAlive(), 15_000)).toBe(true);
+    expect(await waitUntil(() => !primary.isAlive(), 2_000)).toBe(true);
     expect(await waitUntil(async () => (await fixture.logLines()).includes(`${oldPort} SIGTERM`), 2_000)).toBe(true);
     const lines = await fixture.logLines();
     expect(lines).toContain(`${oldPort} POST /session/ses_stuck/abort`);
     expect(lines).toContain(`${oldPort} SIGTERM`);
+  });
+
+  test("cleans up an unreachable draining generation without changing status-probe classification", async () => {
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    await fixture.setBusy(oldPort, ["ses_unknown"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+    await fixture.setStatusUnavailable(oldPort, true);
+
+    expect(await waitUntil(() => !primary.isAlive(), 2_000)).toBe(true);
+    expect(pool.snapshot().generations).toEqual([expect.objectContaining({ role: "primary" })]);
+    expect(await fixture.logLines()).not.toContain(`${oldPort} POST /session/ses_unknown/abort`);
+  });
+
+  test("cleans up a dead draining generation on the next monitor pass", async () => {
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    await fixture.setBusy(oldPort, ["ses_dead"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+    await primary.close();
+
+    expect(await waitUntil(() => pool.snapshot().generations.length === 1, 2_000)).toBe(true);
+    expect(pool.snapshot().generations[0]?.role).toBe("primary");
   });
 
   test("never runs more than one primary and one draining engine", async () => {
