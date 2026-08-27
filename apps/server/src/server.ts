@@ -157,13 +157,19 @@ let desktopCloudSyncQueue: Promise<void> = Promise.resolve();
 const agentDiagnosticsLastRunByServer = new WeakMap<ServerConfig, Map<string, number>>();
 const agentDiagnosticsInFlightByServer = new WeakMap<ServerConfig, Set<string>>();
 const commandAdmissionsByServer = new WeakMap<ServerConfig, Map<string, { fingerprint: string; admittedAt: number }>>();
+type PromptAdmission = {
+  fingerprint: string;
+  admittedAt: number;
+  delivery: Promise<Response>;
+};
+const promptAdmissionsByServer = new WeakMap<ServerConfig, Map<string, PromptAdmission>>();
 const AGENT_DIAGNOSTICS_RATE_LIMIT_CAPACITY = 1_000;
 const AGENT_DIAGNOSTICS_MAX_IN_FLIGHT_PER_SERVER = 16;
 const AGENT_DIAGNOSTICS_MAX_REQUEST_BYTES = 256 * 1024;
 const AGENT_DIAGNOSTICS_DEFAULT_BODY_DEADLINE_MS = 2_000;
 const AGENT_DIAGNOSTICS_ERROR_FLUSH_MS = 25;
-const COMMAND_ADMISSION_CAPACITY = 10_000;
-const COMMAND_ADMISSION_TTL_MS = 24 * 60 * 60 * 1_000;
+const SESSION_ADMISSION_CAPACITY = 10_000;
+const SESSION_ADMISSION_TTL_MS = 24 * 60 * 60 * 1_000;
 
 function rethrowMcpAppHostError(error: unknown): never {
   if (!(error instanceof McpAppHostError)) throw error;
@@ -959,7 +965,7 @@ function isSessionCommandProxyRequest(method: string, proxyPath: string) {
   return method === "POST" && /^\/session\/[^/]+\/command$/.test(normalizeOpencodeProxyPath(proxyPath));
 }
 
-function commandAdmissionFromBody(body: ArrayBuffer | undefined): { messageId: string; fingerprint: string } | null {
+function sessionAdmissionFromBody(body: ArrayBuffer | undefined): { messageId: string; fingerprint: string } | null {
   if (!body) return null;
   const text = new TextDecoder().decode(body);
   try {
@@ -980,7 +986,7 @@ function admitSessionCommand(
   const admissions = commandAdmissionsByServer.get(config) ?? new Map<string, { fingerprint: string; admittedAt: number }>();
   commandAdmissionsByServer.set(config, admissions);
   for (const [key, value] of admissions) {
-    if (now - value.admittedAt <= COMMAND_ADMISSION_TTL_MS) break;
+    if (now - value.admittedAt <= SESSION_ADMISSION_TTL_MS) break;
     admissions.delete(key);
   }
 
@@ -988,12 +994,59 @@ function admitSessionCommand(
   const existing = admissions.get(key);
   if (existing) return existing.fingerprint === admission.fingerprint ? "duplicate" : "conflict";
 
-  if (admissions.size >= COMMAND_ADMISSION_CAPACITY) {
+  if (admissions.size >= SESSION_ADMISSION_CAPACITY) {
     const oldest = admissions.keys().next().value;
     if (oldest) admissions.delete(oldest);
   }
   admissions.set(key, { fingerprint: admission.fingerprint, admittedAt: now });
   return "accepted";
+}
+
+async function deliverSessionPrompt(
+  config: ServerConfig,
+  scope: string,
+  admission: { messageId: string; fingerprint: string },
+  deliver: () => Promise<Response>,
+): Promise<Response> {
+  const now = Date.now();
+  const admissions = promptAdmissionsByServer.get(config) ?? new Map<string, PromptAdmission>();
+  promptAdmissionsByServer.set(config, admissions);
+  for (const [key, value] of admissions) {
+    if (now - value.admittedAt <= SESSION_ADMISSION_TTL_MS) break;
+    admissions.delete(key);
+  }
+
+  const key = hashToken(`${scope}\0${admission.messageId}`);
+  const existing = admissions.get(key);
+  if (existing) {
+    if (existing.fingerprint !== admission.fingerprint) {
+      return jsonResponse({
+        code: "prompt_admission_conflict",
+        message: "This prompt message ID was already admitted with different input",
+      }, 409);
+    }
+    return (await existing.delivery).clone();
+  }
+
+  if (admissions.size >= SESSION_ADMISSION_CAPACITY) {
+    const oldest = admissions.keys().next().value;
+    if (oldest) admissions.delete(oldest);
+  }
+
+  const entry: PromptAdmission = {
+    fingerprint: admission.fingerprint,
+    admittedAt: now,
+    delivery: deliver(),
+  };
+  entry.delivery = entry.delivery.then((response) => {
+    if (!response.ok && admissions.get(key) === entry) admissions.delete(key);
+    return response;
+  }).catch((error: unknown) => {
+    if (admissions.get(key) === entry) admissions.delete(key);
+    throw error;
+  });
+  admissions.set(key, entry);
+  return (await entry.delivery).clone();
 }
 
 function isPromptAsyncProxyRequest(method: string, proxyPath: string) {
@@ -1443,7 +1496,7 @@ export async function proxyOpencodeRequest(input: {
   const targetUrl = buildOpencodeProxyUrl(baseUrl, proxyPath, input.url.search);
   // Managed OpenCode proxy traffic is loopback/engine I/O; keep streaming on Node fetch.
   if (isSessionCommandProxyRequest(method, proxyPath)) {
-    const commandAdmission = commandAdmissionFromBody(body);
+    const commandAdmission = sessionAdmissionFromBody(body);
     if (commandAdmission) {
       const admissionTarget = workspace ? `workspace\0${workspace.id}` : `engine\0${baseUrl}`;
       const admission = admitSessionCommand(
@@ -1501,10 +1554,22 @@ export async function proxyOpencodeRequest(input: {
     return sanitizeProxyResponse(response);
   };
 
-  if (workspace && workspace.workspaceType !== "remote" && !pool && isPromptAsyncProxyRequest(method, proxyPath)) {
-    return withEngineDirectoryFence(input.config, workspace, forward);
+  const deliver = workspace && workspace.workspaceType !== "remote" && !pool && isPromptAsyncProxyRequest(method, proxyPath)
+    ? () => withEngineDirectoryFence(input.config, workspace, forward)
+    : forward;
+  if (isPromptAsyncProxyRequest(method, proxyPath)) {
+    const promptAdmission = sessionAdmissionFromBody(body);
+    if (promptAdmission) {
+      const admissionTarget = workspace ? `workspace\0${workspace.id}` : `engine\0${baseUrl}`;
+      return deliverSessionPrompt(
+        input.config,
+        `${admissionTarget}\0${normalizeOpencodeProxyPath(proxyPath)}`,
+        promptAdmission,
+        deliver,
+      );
+    }
   }
-  return forward();
+  return deliver();
 }
 
 function isEngineEventPath(proxyPath: string): boolean {

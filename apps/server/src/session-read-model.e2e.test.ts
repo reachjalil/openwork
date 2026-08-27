@@ -512,6 +512,102 @@ describe("workspace session read APIs", () => {
     }
   });
 
+  test.serial("delivers each stable prompt message once and permits retry after rejected delivery", async () => {
+    const workspaceRoot = await createWorkspaceRoot();
+    const engineUrl = "http://127.0.0.1:4111";
+    const workspace: WorkspaceInfo = {
+      id: "ws_1",
+      name: "Workspace",
+      path: workspaceRoot,
+      preset: "starter",
+      workspaceType: "local",
+      baseUrl: engineUrl,
+    };
+    const config: ServerConfig = {
+      host: "127.0.0.1",
+      port: 0,
+      token: "owt_test_token",
+      hostToken: "owt_host_token",
+      approval: { mode: "auto", timeoutMs: 1_000 },
+      corsOrigins: ["*"],
+      workspaces: [workspace],
+      authorizedRoots: [workspaceRoot],
+      readOnly: false,
+      startedAt: Date.now(),
+      tokenSource: "cli",
+      hostTokenSource: "cli",
+      logFormat: "pretty",
+      logRequests: false,
+    };
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    const firstDelivery = deferred();
+    let rejectNextDelivery = false;
+    globalThis.fetch = Object.assign(
+      (input: Parameters<typeof fetch>[0]) => {
+        requests.push(input instanceof Request ? input.url : String(input));
+        if (rejectNextDelivery) {
+          rejectNextDelivery = false;
+          return Promise.resolve(new Response(null, { status: 503 }));
+        }
+        if (requests.length === 1) return firstDelivery.promise.then(() => new Response(null, { status: 204 }));
+        return Promise.resolve(new Response(null, { status: 204 }));
+      },
+      { preconnect: originalFetch.preconnect },
+    );
+    const sendPrompt = (body: string) => {
+      const proxyPath = "/session/ses_1/prompt_async";
+      const url = new URL(`http://openwork.invalid/opencode${proxyPath}`);
+      return proxyOpencodeRequest({
+        config,
+        workspace,
+        proxyPath,
+        url,
+        request: new Request(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        }),
+      });
+    };
+    const promptBody = JSON.stringify({
+      messageID: "msg_prompt_once",
+      parts: [{ type: "text", text: "Review this" }],
+    });
+
+    try {
+      const first = sendPrompt(promptBody);
+      const concurrentDuplicate = sendPrompt(promptBody);
+      await Bun.sleep(10);
+      expect(requests).toHaveLength(1);
+
+      firstDelivery.resolve();
+      expect((await first).status).toBe(204);
+      expect((await concurrentDuplicate).status).toBe(204);
+      expect((await sendPrompt(promptBody)).status).toBe(204);
+      expect(requests).toHaveLength(1);
+
+      const conflict = await sendPrompt(JSON.stringify({
+        messageID: "msg_prompt_once",
+        parts: [{ type: "text", text: "Do something else" }],
+      }));
+      expect(conflict.status).toBe(409);
+      await expect(conflict.json()).resolves.toMatchObject({ code: "prompt_admission_conflict" });
+
+      rejectNextDelivery = true;
+      const rejectedBody = JSON.stringify({
+        messageID: "msg_prompt_retry",
+        parts: [{ type: "text", text: "Retry me" }],
+      });
+      expect((await sendPrompt(rejectedBody)).status).toBe(503);
+      expect((await sendPrompt(rejectedBody)).status).toBe(204);
+      expect(requests).toHaveLength(3);
+    } finally {
+      firstDelivery.resolve();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("keeps legacy /w workspace opencode proxy alias", async () => {
     const workspaceRoot = await createWorkspaceRoot();
     const mock = startMockOpencode();
