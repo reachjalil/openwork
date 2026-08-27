@@ -1326,14 +1326,15 @@ export function seedSessionState(workspaceId: string, snapshot: OpenworkSessionS
   // The snapshot's revert cursor is authoritative: messages at/after it are
   // reverted server-side, so the cache must not keep them alive (a later
   // merge would resurrect them once the server deletes them on next prompt).
-  queryClient.setQueryData(key, applyRevertCursor(
+  const reconciled = applyRevertCursor(
     reconcileTranscriptMessages({
       currentMessages: existing ?? [],
       snapshotMessages: incoming,
       reason: "snapshot",
     }),
     snapshot.session.revert?.messageID ?? null,
-  ));
+  );
+  if (reconciled !== existing) queryClient.setQueryData(key, reconciled);
 
   queryClient.setQueryData(todoKey(workspaceId, snapshot.session.id), snapshot.todos);
 }

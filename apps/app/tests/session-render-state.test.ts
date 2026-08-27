@@ -46,6 +46,21 @@ function message(id: string, role: "user" | "assistant", text: string, created: 
 }
 
 describe("session render state", () => {
+  test("reuses the live transcript across repeated no-op derivations", () => {
+    const snapshot = snapshotWithHistory();
+    const live = [
+      message("historical-user", "user", "First prompt", 1),
+      message("historical-assistant", "assistant", "First answer", 2),
+    ];
+    const renderReferences = new Set<UIMessage[]>();
+
+    for (let index = 0; index < 100; index += 1) {
+      renderReferences.add(deriveRenderedSessionMessages({ snapshot, transcriptState: live }));
+    }
+
+    expect(renderReferences.size).toBe(1);
+  });
+
   test("preserves completed message references while the active answer advances", () => {
     const snapshot = snapshotWithHistory();
     const historicalUser = message("historical-user", "user", "First prompt", 1);
