@@ -5,14 +5,8 @@ import { mergeSnapshotAndLiveMessages } from "../sync/message-merge";
 import { applyRevertCursor } from "../sync/transcript-reconcile";
 import { snapshotToUIMessages } from "../sync/usechat-adapter";
 
-const snapshotMessageCache = new WeakMap<OpenworkSessionSnapshot, UIMessage[]>();
-
 function getSnapshotMessages(snapshot: OpenworkSessionSnapshot) {
-  const cached = snapshotMessageCache.get(snapshot);
-  if (cached) return cached;
-  const messages = snapshotToUIMessages(snapshot);
-  snapshotMessageCache.set(snapshot, messages);
-  return messages;
+  return snapshotToUIMessages(snapshot);
 }
 
 export function resolveRenderedSessionSnapshot(input: {

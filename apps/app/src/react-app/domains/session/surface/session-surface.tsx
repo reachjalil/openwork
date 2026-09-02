@@ -997,7 +997,6 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const lastObservationProbeAtRef = useRef<number | null>(null);
   const [observationProbeVersion, setObservationProbeVersion] = useState(0);
   const composerShellRef = useRef<HTMLDivElement>(null);
-  const hydratedKeyRef = useRef<string | null>(null);
   const autoOpenedTargetRef = useRef<string | null>(null);
   const initializedAutoOpenSessionRef = useRef<string | null>(null);
   const opencodeClient = useMemo(
@@ -1049,7 +1048,6 @@ export function SessionSurface(props: SessionSurfaceProps) {
   }, [props.sessionId, currentSnapshot]);
 
   useEffect(() => {
-    hydratedKeyRef.current = null;
     setSteering(false);
     setError(null);
     setRestoringRevertedMessages(false);
@@ -1122,14 +1120,6 @@ export function SessionSurface(props: SessionSurfaceProps) {
     if (!currentSnapshot) return;
     seedSessionState(props.workspaceId, currentSnapshot);
   }, [currentSnapshot, props.sessionId, props.workspaceId]);
-
-  useEffect(() => {
-    if (!currentSnapshot) return;
-    const key = `${props.sessionId}:${currentSnapshot.session.time?.updated ?? currentSnapshot.session.time?.created ?? 0}:${currentSnapshot.messages.length}`;
-    if (hydratedKeyRef.current === key) return;
-    hydratedKeyRef.current = key;
-    seedSessionState(props.workspaceId, currentSnapshot);
-  }, [props.sessionId, currentSnapshot, props.workspaceId]);
 
   const snapshot = resolveRenderedSessionSnapshot({
     sessionId: props.sessionId,
