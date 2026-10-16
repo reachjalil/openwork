@@ -1,8 +1,7 @@
 import DOMPurify from "dompurify";
 import emojiKeywords from "emojilib";
-import { Marked, type Tokens } from "marked";
+import { Marked, type MarkedExtension, type Token, type Tokens } from "marked";
 import { markedEmoji } from "marked-emoji";
-import markedShiki from "marked-shiki";
 import {
   transformerMetaHighlight,
   transformerMetaWordHighlight,
@@ -44,6 +43,14 @@ const MARKDOWN_IMAGE_PREVIEW_MAX_WIDTH = 280;
 const CODE_COPY_ICON = `<svg data-openwork-code-copy-icon="" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
 const CODE_COPIED_ICON = `<svg data-openwork-code-copy-check-icon="" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true" hidden><path d="M20 6 9 17l-5-5"/></svg>`;
 const CODE_WRAP_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true"><path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-3"/><path d="m12 18-3 3 3 3"/></svg>`;
+const INLINE_CODE_FILE_EXTENSIONS = new Set([
+  "astro", "bash", "c", "cc", "cpp", "cs", "css", "dart", "docx", "ex", "exs", "gif", "go", "graphql",
+  "h", "hpp", "htm", "html", "java", "jpeg", "jpg", "js", "json", "jsonc", "jsx", "key", "kt", "kts",
+  "lua", "markdown", "md", "mdx", "mmd", "mjs", "cjs", "odp", "ods", "pdf", "php", "png", "pot", "potx",
+  "ppt", "pptm", "pptx", "prisma", "py", "rb", "rs", "scss", "sh", "sql", "svelte", "svg", "swift",
+  "toml", "ts", "tsv", "tsx", "txt", "log", "vue", "webp", "xls", "xlsx", "xml", "yaml", "yml", "zig",
+]);
+const INLINE_CODE_LINE_SUFFIX = /(?::\d+(?::\d+)?|#L\d+(?:-L?\d+)?)$/i;
 
 function escapeHtml(value: string) {
   return value
@@ -56,6 +63,32 @@ function escapeHtml(value: string) {
 
 function escapeAttribute(value: string) {
   return escapeHtml(value).replace(/`/g, "&#96;");
+}
+
+export function inlineCodeArtifactPath(value: string): string | null {
+  const trimmed = value.trim();
+  const path = trimmed.replace(INLINE_CODE_LINE_SUFFIX, "");
+
+  if (
+    !path ||
+    path.length > 500 ||
+    /[\u0000-\u001f<>"'`|?*]/.test(path) ||
+    /^(?:https?|wss?|ftp|mailto|tel|file):/i.test(path)
+  ) {
+    return null;
+  }
+
+  const normalized = path.replace(/[\\]+/g, "/");
+  const withoutDrive = normalized.replace(/^[A-Za-z]:\//, "/");
+  if (withoutDrive.slice(1).includes(":")) return null;
+
+  const segments = withoutDrive.split("/").filter(Boolean);
+  const filename = segments.at(-1);
+  if (!filename || segments.some((segment) => segment === "." || segment === "..")) return null;
+
+  const extensionIndex = filename.lastIndexOf(".");
+  const extension = extensionIndex >= 0 ? filename.slice(extensionIndex + 1).toLowerCase() : "";
+  return INLINE_CODE_FILE_EXTENSIONS.has(extension) ? path : null;
 }
 
 function safeHref(href: string) {
@@ -131,6 +164,18 @@ function chatCodeBlockHtml(text: string, lang: string | undefined) {
 
 function surfaceCodeBlockHtml(text: string, lang: string | undefined) {
   return `<pre class="my-4 overflow-x-auto rounded-[18px] border border-dls-border/70 bg-gray-1/80 px-4 py-3 text-xs leading-6 text-muted-foreground"><code${codeLanguageClass(lang)}>${escapeHtml(text)}</code></pre>`;
+}
+
+function isMermaidLanguage(lang: string | undefined) {
+  return lang?.trim().split(/\s+/)[0]?.toLowerCase() === "mermaid";
+}
+
+function mermaidBlockHtml(text: string, presentation: MarkdownPresentation) {
+  const borderClass = presentation === "surface" ? "border-dls-border/70" : "border-border/70";
+  const backgroundClass = presentation === "surface" ? "bg-gray-1/80" : "bg-gray-2/60";
+  const buttonClass = "rounded-md px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+
+  return `<div data-openwork-mermaid="" data-openwork-mermaid-state="source" aria-busy="false" class="my-4 overflow-hidden rounded-[18px] border ${borderClass} ${backgroundClass}"><div class="flex min-h-10 items-center gap-2 border-b ${borderClass} px-3 py-2"><span class="me-auto text-xs font-medium text-muted-foreground">Mermaid diagram</span><div role="group" aria-label="Diagram view" class="flex items-center gap-1"><button type="button" data-openwork-mermaid-view="rendered" class="${buttonClass}" aria-pressed="false" disabled>Rendered</button><button type="button" data-openwork-mermaid-view="source" class="${buttonClass}" aria-pressed="true">Source</button><button type="button" data-openwork-mermaid-download="" class="${buttonClass}" aria-label="Download diagram as SVG" hidden>Download SVG</button></div></div><div data-openwork-mermaid-rendered="" class="overflow-auto p-4 [&amp;&gt;svg]:mx-auto [&amp;&gt;svg]:h-auto [&amp;&gt;svg]:max-w-full" hidden></div><pre data-openwork-mermaid-source="" class="overflow-x-auto p-4 text-xs leading-6 text-foreground"><code class="language-mermaid">${escapeHtml(text)}</code></pre><p data-openwork-mermaid-status="" class="border-t ${borderClass} px-3 py-2 text-xs text-muted-foreground" aria-live="polite">Diagram source</p></div>`;
 }
 
 function parseShikiLanguage(lang: string) {
@@ -216,6 +261,7 @@ function sanitizeMarkdownHtml(value: string) {
       "aria-label",
       "aria-pressed",
       "data-openwork-image-preview",
+      "data-openwork-inline-code-path",
       "data-openwork-link-href",
       "data-openwork-link-chevron",
       "data-openwork-shiki",
@@ -223,10 +269,12 @@ function sanitizeMarkdownHtml(value: string) {
       "disabled",
       "hidden",
       "loading",
-      "rel",
-      "start",
-      "style",
-      "target",
+       "rel",
+       "role",
+       "start",
+       "style",
+       "tabindex",
+       "target",
     ],
   });
 }
@@ -310,7 +358,7 @@ function renderImage(profile: MarkdownProfile, href: string, title: string | nul
   return `<img src="${safe}" alt="${escapeAttribute(text)}"${titleAttr} loading="lazy" decoding="async" class="my-4 max-w-full rounded-[18px] border border-dls-border/70">`;
 }
 
-function createMarkedOptions(profile: MarkdownProfile, isAsync: boolean) {
+function createMarkedOptions(profile: MarkdownProfile, presentation: MarkdownPresentation, isAsync: boolean) {
   return {
     async: isAsync,
     breaks: false,
@@ -345,10 +393,16 @@ function createMarkedOptions(profile: MarkdownProfile, isAsync: boolean) {
         return `<blockquote class="${profile.blockquoteClassName}">${this.parser.parse(tokens)}</blockquote>`;
       },
       code({ text, lang }) {
+        if (isMermaidLanguage(lang)) return mermaidBlockHtml(text, presentation);
         return profile.codeBlockHtml(text, lang);
       },
       codespan({ text }) {
-        return `<code class="${profile.codeSpanClassName}">${escapeHtml(text)}</code>`;
+        const path = profile.linkPresentation === "chat" ? inlineCodeArtifactPath(text) : null;
+        const pathAttributes = path
+          ? ` data-openwork-inline-code-path="${escapeAttribute(path)}" role="button" tabindex="0" aria-label="Open ${escapeAttribute(path)}"`
+          : "";
+        const pathClassName = path ? " cursor-pointer transition-colors hover:bg-gray-3/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" : "";
+        return `<code${pathAttributes} class="${profile.codeSpanClassName}${pathClassName}">${escapeHtml(text)}</code>`;
       },
       del({ raw, tokens }) {
         if (!raw.startsWith("~~")) {
@@ -397,9 +451,50 @@ function markdownTransformers() {
   ];
 }
 
+function isCodeToken(token: Token): token is Tokens.Code {
+  return token.type === "code" && "text" in token && typeof token.text === "string";
+}
+
+async function highlightedCodeHtml(
+  token: Tokens.Code,
+  profile: MarkdownProfile,
+) {
+  const [rawLanguage = "text", ...props] = token.lang?.split(" ") ?? [];
+  const language = parseShikiLanguage(rawLanguage);
+  const html = profile.shikiTheme.kind === "dual"
+    ? await codeToHtml(token.text, {
+      lang: language,
+      meta: { __raw: props.join(" ") },
+      themes: {
+        light: profile.shikiTheme.light,
+        dark: profile.shikiTheme.dark,
+      },
+      transformers: markdownTransformers(),
+    })
+    : await codeToHtml(token.text, {
+      lang: language,
+      meta: { __raw: props.join(" ") },
+      theme: profile.shikiTheme.theme,
+      transformers: markdownTransformers(),
+    });
+
+  return profile.shikiContainer.replace("%s", html);
+}
+
+function highlightedCodeExtension(profile: MarkdownProfile): MarkedExtension<string, string> {
+  return {
+    async: true,
+    async walkTokens(token) {
+      if (!isCodeToken(token) || isMermaidLanguage(token.lang)) return;
+      const html = await highlightedCodeHtml(token, profile);
+      Object.assign(token, { type: "html", block: true, text: `${html}\n` });
+    },
+  };
+}
+
 function createMarkdownParsers(presentation: MarkdownPresentation) {
   const profile = markdownProfileForPresentation(presentation);
-  const markdownParser = new Marked<string, string>(createMarkedOptions(profile, false)).use(
+  const markdownParser = new Marked<string, string>(createMarkedOptions(profile, presentation, false)).use(
     markedEmoji({
       emojis: emojiAliases,
       renderer: (token) => escapeHtml(token.emoji),
@@ -408,37 +503,13 @@ function createMarkdownParsers(presentation: MarkdownPresentation) {
   );
   // Math must be registered on both parsers, otherwise formulas would flicker away
   // when a message containing a fenced code block upgrades to the Shiki render.
-  const highlightedMarkdownParser = new Marked<string, string>(createMarkedOptions(profile, true)).use(
+  const highlightedMarkdownParser = new Marked<string, string>(createMarkedOptions(profile, presentation, true)).use(
     markedEmoji({
       emojis: emojiAliases,
       renderer: (token) => escapeHtml(token.emoji),
     }),
     markdownMath(),
-    markedShiki({
-      async highlight(code, lang, props) {
-        const language = parseShikiLanguage(lang);
-
-        if (profile.shikiTheme.kind === "dual") {
-          return codeToHtml(code, {
-            lang: language,
-            meta: { __raw: props.join(" ") },
-            themes: {
-              light: profile.shikiTheme.light,
-              dark: profile.shikiTheme.dark,
-            },
-            transformers: markdownTransformers(),
-          });
-        }
-
-        return codeToHtml(code, {
-          lang: language,
-          meta: { __raw: props.join(" ") },
-          theme: profile.shikiTheme.theme,
-          transformers: markdownTransformers(),
-        });
-      },
-      container: profile.shikiContainer,
-    }),
+    highlightedCodeExtension(profile),
   );
 
   return { markdownParser, highlightedMarkdownParser };

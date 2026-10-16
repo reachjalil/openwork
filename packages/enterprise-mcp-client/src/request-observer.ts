@@ -36,9 +36,12 @@ function bodyRequestPhase(body: BodyInit | null | undefined): EnterpriseMcpReque
       }
       return null
     }
+    if (request.data.method === "server/discover") return "mcp-discovery"
     if (request.data.method === "initialize") return "mcp-initialize"
     if (request.data.method === "tools/list") return "mcp-tool-discovery"
     if (request.data.method === "tools/call") return "mcp-tool-execution"
+    if (request.data.method === "resources/list" || request.data.method === "resources/templates/list") return "mcp-resource-discovery"
+    if (request.data.method === "resources/read") return "mcp-resource-read"
   } catch {
     return null
   }
@@ -48,9 +51,12 @@ function bodyRequestPhase(body: BodyInit | null | undefined): EnterpriseMcpReque
 
 function isMcpRequestPhase(phase: EnterpriseMcpRequestPhase): boolean {
   return phase === "endpoint-request"
+    || phase === "mcp-discovery"
     || phase === "mcp-initialize"
     || phase === "mcp-tool-discovery"
     || phase === "mcp-tool-execution"
+    || phase === "mcp-resource-discovery"
+    || phase === "mcp-resource-read"
 }
 
 export function classifyEnterpriseMcpRequest(url: URL, init?: RequestInit): EnterpriseMcpRequestPhase {
