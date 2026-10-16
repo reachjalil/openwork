@@ -1282,7 +1282,22 @@ export function shouldShowMessageListLoading(
   return status === "streaming" || (status === "submitted" && messageCount > 0)
 }
 
+export function hasVisibleStreamingReasoning(messages: UIMessage[], showThinking: boolean) {
+  if (!showThinking) return false
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role !== "assistant") return false
+    if (message.parts.some((part) =>
+      part.type === "reasoning" && part.state === "streaming" && part.text.trim()
+    )) return true
+  }
+
+  return false
+}
+
 export function MessageList({ messages, status, activityStatus, retryStatus }: MessageListProps) {
+  const { showThinking } = useMessageList()
   const isStreaming = status === "streaming" || status === "retrying"
   const runActive = status === "submitted" || status === "streaming" || status === "retrying"
   const runStartedAtRef = React.useRef<number | null>(null)
@@ -1324,6 +1339,7 @@ export function MessageList({ messages, status, activityStatus, retryStatus }: M
   )
   const hasVisibleToolActivity = latestAssistantToolParts.some(isToolPartInFlight)
   const showLoading = shouldShowMessageListLoading(status, messages.length, hasVisibleToolActivity)
+    && !hasVisibleStreamingReasoning(messages, showThinking)
   const currentToolCallIds = React.useMemo(
     () => new Set(latestAssistantToolParts.map((part) => part.toolCallId)),
     [latestAssistantToolParts],
