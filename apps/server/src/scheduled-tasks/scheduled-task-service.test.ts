@@ -644,6 +644,36 @@ describe("scheduled task service", () => {
     store.close();
   });
 
+  test("drains one durable occurrence when duplicate OS wakes race", async () => {
+    const store = await openStore();
+    let current = Date.UTC(2026, 6, 28, 8, 0);
+    let executions = 0;
+    const countingExecution: ScheduledTaskExecutionAdapter = {
+      async execute(request, options) {
+        executions += 1;
+        return execution.execute(request, options);
+      },
+      cancel: execution.cancel,
+    };
+    const { service, reviewed } = await createReviewedTask(store, () => current, {
+      execution: countingExecution,
+    });
+    await service.enable("ws_test", reviewed.task.id);
+    current = Date.UTC(2026, 6, 28, 9, 0);
+
+    const wakes = await Promise.all([
+      service.tick({ now: current, source: "os-wake", workspaceId: "ws_test" }),
+      service.tick({ now: current, source: "os-wake", workspaceId: "ws_test" }),
+    ]);
+    await service.waitForIdle();
+
+    expect(wakes.flatMap((wake) => wake.claimedRunIds)).toHaveLength(1);
+    expect(executions).toBe(1);
+    expect(service.listRuns("ws_test", reviewed.task.id)).toHaveLength(1);
+    expect(service.listRuns("ws_test", reviewed.task.id)[0]?.status).toBe("completed");
+    store.close();
+  });
+
   test("turns live workspace authority loss into repairable attention", async () => {
     const store = await openStore();
     let current = Date.UTC(2026, 6, 28, 8, 0);

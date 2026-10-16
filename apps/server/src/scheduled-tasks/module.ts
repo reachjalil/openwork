@@ -1,6 +1,8 @@
 import { realpath, stat } from "node:fs/promises";
 import { basename, relative, resolve, sep } from "node:path";
 import type { ScheduledTaskArtifactReference, ScheduledTaskTypedError } from "@openwork/types/scheduled-tasks";
+import type { ScheduledTaskRun } from "@openwork/types/scheduled-tasks";
+import type { ScheduledTaskTickInput, ScheduledTaskTickResult } from "@openwork/scheduled-tasks";
 import { ApiError } from "../errors.js";
 import {
   registerScheduledTaskRoutes,
@@ -57,6 +59,9 @@ export interface ScheduledTasksModule {
   readonly service: ScheduledTaskService;
   registerRoutes(options: ScheduledTaskRouteDependencies): void;
   onWorkspaceRemoved(workspaceId: string): Promise<void>;
+  tickAndWait(input: ScheduledTaskTickInput): Promise<ScheduledTaskTickResult>;
+  runOnceAndWait(workspaceId: string, taskId: string): Promise<ScheduledTaskRun>;
+  nextDueAt(): number | null;
   start(): void;
   stop(): Promise<void>;
 }
@@ -367,6 +372,17 @@ export async function createScheduledTasksModule(
       },
       async onWorkspaceRemoved(workspaceId) {
         await service.markWorkspaceUnavailable(workspaceId);
+      },
+      tickAndWait(input) {
+        return scheduledTaskScheduler.tickAndWait(input);
+      },
+      async runOnceAndWait(workspaceId, taskId) {
+        const run = await service.runOnce(workspaceId, taskId);
+        await service.waitForIdle();
+        return store.getRun(run.id) ?? run;
+      },
+      nextDueAt() {
+        return store.nextDueAt();
       },
       start() {
         scheduledTaskScheduler.start({ immediate: true });
