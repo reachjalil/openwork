@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StreamableHTTPTransport } from "@hono/mcp"
 import type { Hono } from "hono"
+import type { RequestIdVariables } from "hono/request-id"
 import { z } from "zod"
 import { env } from "../env.js"
 import { publicRoute, tokenRoute } from "../middleware/index.js"
@@ -8,9 +9,13 @@ import { getMcpResourceContext, verifyMcpRequest } from "./auth.js"
 import { buildMcpCatalog, getToolDescription, loadOpenApiDocument, type McpToolOperation } from "./catalog.js"
 import { invokeMcpOperation } from "./invoke.js"
 import { preflightMcpJsonRpcRequest } from "./json-rpc-preflight.js"
+import { appLogger } from "../observability/logger.js"
+import { normalizeMcpProtocolVersionHeader } from "./protocol-version.js"
 import { getDenAuthIssuer } from "./jwt-policy.js"
 import { DEN_MCP_REQUESTED_SCOPES } from "./scopes.js"
 import { SEARCH_CAPABILITIES_TOOL_NAME, searchCapabilities } from "./search.js"
+
+const protocolVersionLogger = appLogger.child({ component: "mcp_protocol_version" })
 
 const CATALOG_CACHE_TTL_MS = 5 * 60 * 1000
 
@@ -55,7 +60,7 @@ export function protectedResourceMetadata(request: Request, route: "mcp" | "agen
   }
 }
 
-export function registerMcpRoutes<T extends { Variables: Record<string, unknown> }>(app: Hono<T>) {
+export function registerMcpRoutes<T extends { Variables: RequestIdVariables & Record<string, unknown> }>(app: Hono<T>) {
   app.get("/.well-known/oauth-protected-resource", publicRoute, (c) => c.json(protectedResourceMetadata(c.req.raw)))
   app.get("/.well-known/oauth-protected-resource/mcp", publicRoute, (c) => c.json(protectedResourceMetadata(c.req.raw)))
   app.get("/mcp/.well-known/oauth-protected-resource", publicRoute, (c) => c.json(protectedResourceMetadata(c.req.raw)))
@@ -75,6 +80,10 @@ export function registerMcpRoutes<T extends { Variables: Record<string, unknown>
     if (preflightResponse) {
       return preflightResponse
     }
+
+    normalizeMcpProtocolVersionHeader(c.req.raw.headers, "mcp", requestId, (message, fields) => {
+      protocolVersionLogger.warn(message, fields)
+    })
 
     const catalog = await getCatalog(app as unknown as Hono, c.env)
     const server = new McpServer({

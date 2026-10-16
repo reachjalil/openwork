@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import type { Hono } from "hono"
 import { bodyLimit } from "hono/body-limit"
 import type { RequestIdVariables } from "hono/request-id"
@@ -18,6 +19,7 @@ import {
   PluginConfigObjectTable,
   PluginTable,
   type ExternalMcpOAuthConfiguration,
+  type ExternalMcpToolPolicy,
 } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId, type DenTypeId } from "@openwork-ee/utils/typeid"
 import { db } from "../../db.js"
@@ -63,21 +65,31 @@ import {
   normalizeExternalMcpIdentityUrl,
   repairExternalMcpOAuthIssuer,
   replaceExternalMcpConnectionAccess,
+  setExternalMcpConnectionToolPolicy,
   updateExternalMcpConnection,
   type ExternalMcpConnectionRow,
 } from "../../capability-sources/external-mcp-connections.js"
+import { evaluateToolPolicy } from "../../capability-sources/external-mcp-tool-policy.js"
 import { memberFacingMcpConnectionsEnabled } from "../../capability-sources/external-mcp-rollout.js"
+import { externalMcpAppResourceUri } from "../../mcp/external-capabilities.js"
+import { EXECUTE_CAPABILITY_TOOL_NAME, SEARCH_CAPABILITIES_TOOL_NAME } from "../../mcp/search.js"
 import { listNativeProviderUsableEntries } from "../../capability-sources/native-provider-connections.js"
+import { getNativeOAuthProvider } from "../../capability-sources/provider-registry.js"
 import { connectCallbackPage } from "../../capability-sources/oauth-callback-page.js"
 import { getConnectedAccount, getOrgOAuthClient, upsertOrgOAuthClient } from "../../capability-sources/oauth-credentials.js"
 import { assertPublicUrl, createGuardedFetch, createRealmSafeFetch } from "../../capability-sources/url-guard.js"
 import {
   externalMcpCallbackUrl,
+  externalMcpCompatibleCallbackUrl,
   externalMcpClientMetadataUrl,
   externalMcpSharedCallbackUrl,
 } from "../../capability-sources/external-mcp-oauth-contract.js"
 import type { MemberTeamSummary } from "../../orgs.js"
-import { EXTERNAL_MCP_PRESETS } from "../../capability-sources/external-mcp-presets.js"
+import {
+  EXTERNAL_MCP_PRESETS,
+  externalMcpPresetListResponseSchema,
+  externalMcpPresetResponseSchema,
+} from "../../capability-sources/external-mcp-presets.js"
 import {
   MAX_RESOLVE_QUERY_LENGTH,
   classifyResolveQuery,
@@ -87,6 +99,7 @@ import {
   suggestConnectionName,
 } from "../../capability-sources/external-mcp-resolve.js"
 import {
+  externalMcpOAuthConfigurationDefaults,
   pluginMcpRequiresPreRegisteredOAuthClient,
   requiredPluginMcpAuthType,
 } from "../../capability-sources/external-mcp-auth-policy.js"
@@ -111,9 +124,50 @@ import {
   orgAccessFailureStatus,
 } from "./shared.js"
 import type { OrgRouteVariables } from "./shared.js"
+import { beginNativeProviderConnect } from "./oauth-providers.js"
 
 const connectionParamsSchema = idParamSchema("connectionId", "externalMcpConnection")
 const logger = appLogger.child({ component: "mcp_connections" })
+
+// The App-host gateway never exposes its bounded search/execute tools as apps.
+const PROXY_GATEWAY_TOOL_NAMES = new Set([SEARCH_CAPABILITIES_TOOL_NAME, EXECUTE_CAPABILITY_TOOL_NAME])
+
+/**
+ * Mirrors the Desktop private App-host naming so Dashboard elements carry the
+ * same reference shape desktop entries use (`connectMcpAppHostName` in
+ * `apps/server/src/connect-mcp-server-catalog.ts` and `projectedMcpToolName`
+ * in `apps/server/src/mcp-app-host.ts`). Connect launches resolve by
+ * connection reference, so these names are display and reference data only;
+ * drift cannot break a launch.
+ */
+const CONNECT_MCP_APP_HOST_NAME_PREFIX = "openwork-app-host-connect-"
+
+export function connectMcpAppHostServerName(connectionId: string): string {
+  const digest = createHash("sha256").update(connectionId).digest("hex").slice(0, 12)
+  return `${CONNECT_MCP_APP_HOST_NAME_PREFIX}${digest}`
+}
+
+export function projectedMcpToolName(serverName: string, toolName: string): string {
+  const sanitize = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "_")
+  return `${sanitize(serverName)}_${sanitize(toolName)}`
+}
+
+/** Mirrors the App-host proxy's app-audience visibility rule. */
+export function mcpToolVisibleToApp(tool: { _meta?: unknown }): boolean {
+  const meta = isRecord(tool._meta) ? tool._meta : {}
+  const ui = isRecord(meta.ui) ? meta.ui : {}
+  if (ui.visibility === undefined) return true
+  return Array.isArray(ui.visibility)
+    && ui.visibility.every((entry) => entry === "model" || entry === "app")
+    && ui.visibility.includes("app")
+}
+
+/** True when the launch tool declares required input, so a tile cannot start it with empty arguments. */
+export function mcpToolRequiresInput(tool: { inputSchema?: unknown }): boolean {
+  const schema: unknown = tool.inputSchema
+  if (!isRecord(schema)) return false
+  return Array.isArray(schema.required) && schema.required.length > 0
+}
 const MANUAL_MCP_TOOL_REQUEST_MAX_BYTES = 1024 * 1024
 const externalMcpDiscoveryFetch = env.allowPrivateMcpUrls ? createRealmSafeFetch() : createGuardedFetch()
 
@@ -248,7 +302,8 @@ const clientMetadataResponseSchema = z.object({
   token_endpoint_auth_method: z.literal("none"),
 }).meta({ ref: "ExternalMcpClientMetadata" })
 
-const createConnectionBodySchema = z.object({
+const createExternalConnectionBodySchema = z.object({
+  kind: z.literal("external_mcp").optional(),
   name: z.string().trim().min(1).max(255),
   url: externalMcpUrlSchema,
   authType: z.enum(["oauth", "apikey", "none"]),
@@ -260,10 +315,26 @@ const createConnectionBodySchema = z.object({
     tokenEndpointAuthMethod: z.enum(["client_secret_basic", "client_secret_post"]).optional(),
   }).optional(),
   authorizationServerIssuer: z.string().trim().url().max(2048).nullable().optional(),
-  requestedScopes: z.array(z.string().trim().min(1).max(255)).max(100).optional().default([]),
+  requestedScopes: z.array(z.string().trim().min(1).max(255)).max(100).optional(),
   /** Who can USE the connection. Defaults to org-wide so the naive quick-add path matches expectations, but it's an explicit, editable choice. */
   access: accessInputSchema.optional().default({ orgWide: true, memberIds: [], teamIds: [] }),
 })
+
+const createNativeProviderConnectionBodySchema = z.object({
+  kind: z.literal("native_provider"),
+  nativeProviderKey: z.string().trim().min(1).max(64),
+  name: z.string().trim().min(1).max(255),
+  oauthClient: z.object({
+    clientId: z.string().trim().min(1).max(512),
+    clientSecret: z.string().trim().min(1).max(4096).optional(),
+    features: z.array(z.string().trim().min(1).max(128)).optional(),
+  }),
+})
+
+const createConnectionBodySchema = z.union([
+  createNativeProviderConnectionBodySchema,
+  createExternalConnectionBodySchema,
+])
 
 const updateConnectionBodySchema = z.object({
   expectedUpdatedAt: z.string().datetime(),
@@ -396,9 +467,42 @@ const connectionToolSchema = z.object({
   annotations: connectionToolAnnotationsSchema.optional(),
 }).meta({ ref: "ExternalMcpConnectionTool" })
 
+const connectionToolPolicySchema = z.object({
+  allDisabled: z.boolean(),
+  disabledTools: z.array(z.string()),
+  updatedBy: z.string().nullable(),
+  updatedAt: z.string().datetime().nullable(),
+}).meta({ ref: "ExternalMcpConnectionToolPolicy" })
+
+const connectionToolPolicyInputSchema = z.object({
+  allDisabled: z.boolean(),
+  disabledTools: z.array(z.string().trim().min(1).max(255)).max(500),
+}).meta({ ref: "ExternalMcpConnectionToolPolicyInput" })
+
+const connectionToolPolicyResponseSchema = z.object({
+  policy: connectionToolPolicySchema,
+}).meta({ ref: "ExternalMcpConnectionToolPolicyResponse" })
+
 const connectionToolListResponseSchema = z.object({
   tools: z.array(connectionToolSchema),
+  policy: connectionToolPolicySchema,
 }).meta({ ref: "ExternalMcpConnectionToolListResponse" })
+
+const connectionMcpAppSchema = z.object({
+  serverName: z.string(),
+  connectionId: z.string(),
+  toolName: z.string(),
+  projectedToolName: z.string(),
+  resourceUri: z.string(),
+  title: z.string().nullable(),
+  description: z.string().nullable(),
+  requiresInput: z.boolean(),
+  requiresApproval: z.boolean(),
+}).meta({ ref: "ExternalMcpConnectionMcpApp" })
+
+const connectionMcpAppListResponseSchema = z.object({
+  apps: z.array(connectionMcpAppSchema),
+}).meta({ ref: "ExternalMcpConnectionMcpAppListResponse" })
 
 const runConnectionToolBodySchema = z.object({
   toolName: z.string().trim().min(1).max(255),
@@ -458,6 +562,18 @@ const connectionNotReadySchema = z.object({
   message: z.string(),
 }).meta({ ref: "ExternalMcpConnectionNotReadyError" })
 
+const connectionToolPolicyBlockedSchema = z.object({
+  error: z.literal("policy_blocked"),
+  message: z.string(),
+  disabledBy: z.string().nullable(),
+  disabledAt: z.string().datetime().nullable(),
+}).meta({ ref: "ExternalMcpConnectionToolPolicyBlockedError" })
+
+const connectionToolRunForbiddenSchema = z.union([
+  forbiddenSchema,
+  connectionToolPolicyBlockedSchema,
+]).meta({ ref: "ExternalMcpConnectionToolRunForbiddenError" })
+
 const connectionCreatedResponseSchema = connectionResponseSchema.extend({
   links: z.object({
     /** Where members connect their own account for per_member connections. Share this with the team. */
@@ -484,8 +600,15 @@ function memberConnectLinks(connection: ExternalMcpConnectionRow) {
   yourConnections.searchParams.set("connectionId", connection.id)
   return {
     yourConnections: yourConnections.toString(),
-    oauthCallback: callbackRedirectUri(connection),
+    oauthCallback: connection.kind === "native_provider" && connection.nativeProviderKey
+      ? nativeProviderCallbackUrl(connection.nativeProviderKey)
+      : callbackRedirectUriWithClient(connection, null),
   }
+}
+
+function nativeProviderCallbackUrl(nativeProviderKey: string) {
+  const baseUrl = env.apiPublicUrl ?? env.betterAuthUrl
+  return new URL(`/v1/oauth-providers/${encodeURIComponent(nativeProviderKey)}/connect/callback`, baseUrl).toString()
 }
 
 export function isAgentApiKeyConnection(input: { authType: string; sessionId?: string | null }) {
@@ -501,19 +624,6 @@ const listConnectionsQuerySchema = z.object({
   scope: z.enum(["usable", "manageable"]).optional().default("usable"),
 })
 
-const presetResponseSchema = z.object({
-  presetId: z.string(),
-  displayName: z.string(),
-  description: z.string(),
-  url: z.string(),
-  authType: z.enum(["oauth", "apikey", "none"]),
-  requiresOAuthClient: z.boolean().optional(),
-}).meta({ ref: "ExternalMcpPresetResponse" })
-
-const presetListResponseSchema = z.object({
-  presets: z.array(presetResponseSchema),
-}).meta({ ref: "ExternalMcpPresetListResponse" })
-
 const resolveConnectionBodySchema = z.object({
   /** Free-form: a full URL, a bare host, or a product name like "vercel". */
   query: z.string().min(1).max(MAX_RESOLVE_QUERY_LENGTH),
@@ -525,7 +635,7 @@ const resolveConnectionResponseSchema = z.object({
   attempted: z.array(z.string()),
   /** Why the query produced no candidates (only for not_found). */
   reason: z.string().optional(),
-  preset: presetResponseSchema.optional(),
+  preset: externalMcpPresetResponseSchema.optional(),
   match: z.object({
     url: z.string(),
     suggestedName: z.string(),
@@ -715,6 +825,27 @@ function resolveCreatorName(context: PluginArchActorContext["organizationContext
   return member?.user.name.trim() || member?.user.email || null
 }
 
+/**
+ * Display names only — never an email fallback: this label reaches non-admin
+ * members through the tools endpoint and agent policy_blocked errors.
+ */
+function resolvePolicyEditorLabel(context: PluginArchActorContext["organizationContext"], memberId: string): string | null {
+  const member = context.members.find((entry) => entry.id === memberId)
+  return member?.user.name.trim() || null
+}
+
+function toToolPolicyResponse(
+  policy: ExternalMcpToolPolicy | null | undefined,
+  options: { includeAttribution: boolean },
+) {
+  return {
+    allDisabled: policy?.allDisabled ?? false,
+    disabledTools: policy?.disabledTools ?? [],
+    updatedBy: options.includeAttribution ? policy?.updatedByName ?? null : null,
+    updatedAt: policy?.updatedAt ?? null,
+  }
+}
+
 function legacyExternalMcpConnectionIdsFromPayload(payload: Record<string, unknown> | null): string[] {
   const ids = new Set<string>()
   const collect = (value: unknown) => {
@@ -890,6 +1021,31 @@ function oauthRegistrationSourceForClient(
   return oauthClient ? "pre-registered" : null
 }
 
+function registeredRedirectUriForClient(oauthClient: Awaited<ReturnType<typeof getOrgOAuthClient>>): string | null {
+  const registeredRedirectUri = oauthClient?.extra?.registeredRedirectUri
+  return typeof registeredRedirectUri === "string" ? registeredRedirectUri : null
+}
+
+function callbackRedirectUriWithClient(
+  connection: ExternalMcpConnectionRow,
+  oauthClient: Awaited<ReturnType<typeof getOrgOAuthClient>>,
+) {
+  if (connection.authType !== "oauth") return "http://127.0.0.1/unused-mcp-oauth-callback"
+  return externalMcpCompatibleCallbackUrl({
+    connectionId: connection.id,
+    callbackMode: connection.oauthConfiguration?.callbackMode ?? "legacy-v1",
+    createdAt: connection.createdAt,
+    registeredRedirectUri: registeredRedirectUriForClient(oauthClient),
+  })
+}
+
+async function callbackRedirectUri(connection: ExternalMcpConnectionRow) {
+  const oauthClient = connection.authType === "oauth"
+    ? await getOrgOAuthClient(connection.organizationId, connection.id)
+    : null
+  return callbackRedirectUriWithClient(connection, oauthClient)
+}
+
 async function toConnectionResponse(
   row: ExternalMcpConnectionRow,
   options: {
@@ -906,6 +1062,7 @@ async function toConnectionResponse(
   let connectedForMe = connected && row.credentialMode === "shared"
   let grantedScopes = row.scope?.split(/\s+/).filter(Boolean) ?? []
   let callerCredentialHealth = row.credentialHealth
+  let callerExternalAccountId: string | null = null
   if (row.credentialMode === "per_member") {
     const account = await getConnectedAccount({
       organizationId: row.organizationId,
@@ -913,6 +1070,7 @@ async function toConnectionResponse(
       providerId: row.id,
     })
     connectedForMe = Boolean(account?.accessToken)
+    callerExternalAccountId = account?.accessToken ? account.externalAccountId : null
     callerCredentialHealth = account?.credentialHealth ?? null
     grantedScopes = account?.scopes ?? []
     if (options.includeAccess) {
@@ -946,11 +1104,13 @@ async function toConnectionResponse(
   const oauthRegistrationSource = oauthRegistrationSourceForClient(oauthClient)
   const callbackMode = row.oauthConfiguration?.callbackMode ?? null
   const requiredAuthTypes = [...options.requiredAuthTypes]
-  const presetRequiredAuthType = requiredPluginMcpAuthType({ declaredAuthType: null, url: row.url })
+  const presetRequiredAuthType = row.kind === "external_mcp"
+    ? requiredPluginMcpAuthType({ declaredAuthType: null, url: row.url })
+    : null
   if (requiredAuthTypes.length === 0 && presetRequiredAuthType) requiredAuthTypes.push(presetRequiredAuthType)
   const authPolicyConfirmed = options.identityManagedBy.length === 0 || requiredAuthTypes.length > 0
   const authTypeMismatch = requiredAuthTypes.some((requiredAuthType) => requiredAuthType !== row.authType)
-  const oauthClientRequired = row.authType === "oauth" && pluginMcpRequiresPreRegisteredOAuthClient(row.url)
+  const oauthClientRequired = row.kind === "external_mcp" && row.authType === "oauth" && pluginMcpRequiresPreRegisteredOAuthClient(row.url)
   const oauthClientConfigured = Boolean(oauthClient)
   const setupRequired = options.identityManagedBy.length > 0 && (
     !authPolicyConfirmed
@@ -973,6 +1133,14 @@ async function toConnectionResponse(
     url: row.url,
     authType: row.authType,
     credentialMode: row.credentialMode,
+    // Which service a native connector fronts ("google-workspace"), so a
+    // member's card can say what they would be signing in to. Null for
+    // external MCP rows, whose url already names the service.
+    nativeProviderKey: row.kind === "native_provider" ? row.nativeProviderKey : null,
+    // The caller's own connected identity (their email for Google), so the
+    // card can say WHICH account is signed in — the whole point of holding
+    // more than one connector for the same service.
+    externalAccountId: callerExternalAccountId,
     connected,
     connectedAt: connectedAt ? connectedAt.toISOString() : null,
     ...(options.includeAccess ? { createdByName: options.createdByName ?? null } : {}),
@@ -996,10 +1164,12 @@ async function toConnectionResponse(
     ...(options.includeAccess ? {
       oauthClientId: oauthClient?.clientId ?? null,
       oauthCallbackUrl: row.authType === "oauth"
-        ? externalMcpCallbackUrl({ connectionId: row.id, callbackMode: callbackMode ?? "legacy-v1" })
+        ? row.kind === "native_provider" && row.nativeProviderKey
+          ? nativeProviderCallbackUrl(row.nativeProviderKey)
+          : callbackRedirectUriWithClient(row, oauthClient)
         : null,
-      oauthSharedCallbackUrl: row.authType === "oauth" ? externalMcpSharedCallbackUrl() : null,
-      oauthClientMetadataUrl: row.authType === "oauth" ? externalMcpClientMetadataUrl() : null,
+      oauthSharedCallbackUrl: row.kind === "external_mcp" && row.authType === "oauth" ? externalMcpSharedCallbackUrl() : null,
+      oauthClientMetadataUrl: row.kind === "external_mcp" && row.authType === "oauth" ? externalMcpClientMetadataUrl() : null,
       oauthCallbackMode: callbackMode,
       oauthRegistrationSource,
       authorizationServerIssuer: row.oauthConfiguration?.authorizationServerIssuer ?? null,
@@ -1009,12 +1179,56 @@ async function toConnectionResponse(
   }
 }
 
-function callbackRedirectUri(connection: ExternalMcpConnectionRow) {
-  if (connection.authType !== "oauth") return "http://127.0.0.1/unused-mcp-oauth-callback"
-  return externalMcpCallbackUrl({
-    connectionId: connection.id,
-    callbackMode: connection.oauthConfiguration?.callbackMode ?? "legacy-v1",
+export type MemberUsableConnectionFacts = {
+  id: string
+  name: string
+  url: string
+  nativeProviderKey: string | null
+  credentialMode: "shared" | "per_member"
+  connected: boolean
+  connectedAt: string | null
+  connectedForMe: boolean
+  needsReconnect: boolean
+  authPolicyConfirmed?: boolean
+  authTypeMismatch?: boolean
+  oauthClientConfigured?: boolean
+  oauthClientRequired?: boolean
+  setupRequired?: boolean
+  issuerReviewRequired?: boolean
+  reconnectActionOwner?: string | null
+}
+
+export async function listMemberUsableConnectionFacts(input: {
+  context: PluginArchActorContext
+}): Promise<MemberUsableConnectionFacts[]> {
+  const organization = input.context.organizationContext.organization
+  if (!memberFacingMcpConnectionsEnabled(organization.metadata, { gatingEnabled: env.mcpConnectionsGatingEnabled })) {
+    return []
+  }
+
+  const member = input.context.organizationContext.currentMember
+  const teamIds = input.context.memberTeams.map((team) => team.id)
+  const rows = await listVisibleExternalMcpConnections({
+    organizationId: organization.id,
+    orgMembershipId: member.id,
+    teamIds,
   })
+  const provenance = await requiredByForConnections({ context: input.context, includeAllPluginNames: false, rows })
+  const connections = await Promise.all(rows.map((row) =>
+    toConnectionResponse(row, {
+      callerOrgMembershipId: member.id,
+      createdByName: resolveCreatorName(input.context.organizationContext, row.createdByOrgMembershipId),
+      includeAccess: false,
+      requiredBy: provenance.requiredBy.get(row.id) ?? [],
+      identityManagedBy: provenance.identityManagedBy.get(row.id) ?? [],
+      requiredAuthTypes: provenance.requiredAuthTypes.get(row.id) ?? new Set(),
+    })))
+  const nativeEntries = await listNativeProviderUsableEntries({
+    organizationId: organization.id,
+    orgMembershipId: member.id,
+    teamIds,
+  })
+  return [...nativeEntries, ...connections]
 }
 
 function invalidMcpOAuthCallback(message: string): Response {
@@ -1081,6 +1295,9 @@ async function handleExternalMcpOAuthCallback(input: {
   ])
   if (!connection || !members[0]) {
     return invalidMcpOAuthCallback("Unknown authorization transaction.")
+  }
+  if (connection.kind !== "external_mcp") {
+    return invalidMcpOAuthCallback("Native provider connectors do not use the external MCP OAuth callback.")
   }
   const configuredIssuer = connection.oauthConfiguration?.authorizationServerIssuer ?? null
   const discovery = connection.oauthConfiguration?.discovery
@@ -1208,7 +1425,7 @@ async function handleExternalMcpOAuthCallback(input: {
     await completeAuthorization(
       connection,
       code,
-      externalMcpCallbackUrl({ connectionId: connection.id, callbackMode }),
+      await callbackRedirectUri(connection),
       member,
       input.requestId,
       state,
@@ -1423,7 +1640,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       summary: "List predefined External MCP Connection presets",
       description: "Common third-party MCP servers (Notion, Linear, Stripe, Slack, ...) an admin can add with one click, prefilled with a real name and URL.",
       responses: {
-        200: jsonResponse("Presets.", presetListResponseSchema),
+        200: jsonResponse("Presets.", externalMcpPresetListResponseSchema),
         401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
       },
     }),
@@ -1535,36 +1752,81 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         return c.json({ connections })
       }
 
-      // Org-level kill switch: explicitly opted-out orgs return an empty list —
-      // indistinguishable from "nothing published", on every desktop version in
-      // the field (see external-mcp-rollout.ts).
-      if (!memberFacingMcpConnectionsEnabled(payload.organization.metadata, { gatingEnabled: env.mcpConnectionsGatingEnabled })) {
-        return c.json({ connections: [] })
+      return c.json({ connections: await listMemberUsableConnectionFacts({ context }) })
+    },
+  )
+
+  app.get(
+    "/v1/mcp-connections/:connectionId/tool-policy",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "Get the tool policy for an External MCP Connection",
+      responses: {
+        200: jsonResponse("External MCP tool policy.", connectionToolPolicyResponseSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        403: jsonResponse("The caller must be a workspace owner or admin.", forbiddenSchema),
+        404: jsonResponse("Unknown connection.", connectionNotFoundSchema),
+      },
+    }),
+    orgRoleRoute(["admin"]),
+    paramValidator(connectionParamsSchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const { connectionId } = c.req.valid("param")
+      const connection = await getExternalMcpConnection({
+        organizationId: payload.organization.id,
+        connectionId: normalizeDenTypeId("externalMcpConnection", connectionId),
+      })
+      if (!connection) {
+        return c.json({ error: "connection_not_found", message: "Unknown connection." }, 404)
+      }
+      return c.json({ policy: toToolPolicyResponse(connection.toolPolicy, { includeAttribution: true }) })
+    },
+  )
+
+  app.put(
+    "/v1/mcp-connections/:connectionId/tool-policy",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "Update the tool policy for an External MCP Connection",
+      responses: {
+        200: jsonResponse("External MCP tool policy updated.", connectionToolPolicyResponseSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        403: jsonResponse("The caller must be a workspace owner or admin.", forbiddenSchema),
+        404: jsonResponse("Unknown connection.", connectionNotFoundSchema),
+      },
+    }),
+    orgRoleRoute(["admin"]),
+    paramValidator(connectionParamsSchema),
+    jsonValidator(connectionToolPolicyInputSchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const { connectionId } = c.req.valid("param")
+      const externalMcpConnectionId = normalizeDenTypeId("externalMcpConnection", connectionId)
+      const connection = await getExternalMcpConnection({
+        organizationId: payload.organization.id,
+        connectionId: externalMcpConnectionId,
+      })
+      if (!connection) {
+        return c.json({ error: "connection_not_found", message: "Unknown connection." }, 404)
       }
 
-      const rows = await listVisibleExternalMcpConnections({
-        organizationId: payload.organization.id,
-        orgMembershipId: payload.currentMember.id,
-        teamIds: memberTeams.map((team) => team.id),
-      })
-      const provenance = await requiredByForConnections({ context, includeAllPluginNames: false, rows })
-      const connections = await Promise.all(rows.map((row) =>
-        toConnectionResponse(row, {
-          callerOrgMembershipId: payload.currentMember.id,
-          createdByName: resolveCreatorName(payload, row.createdByOrgMembershipId),
-          includeAccess: false,
-          requiredBy: provenance.requiredBy.get(row.id) ?? [],
-          identityManagedBy: provenance.identityManagedBy.get(row.id) ?? [],
-          requiredAuthTypes: provenance.requiredAuthTypes.get(row.id) ?? new Set(),
-        })))
-      // Native providers (e.g. google-workspace) join the same list once the
-      // org saved an OAuth client for them — same card, same connect flow,
-      // same org kill switch (this sits after the check on purpose).
-      const nativeEntries = await listNativeProviderUsableEntries({
-        organizationId: payload.organization.id,
-        orgMembershipId: payload.currentMember.id,
-      })
-      return c.json({ connections: [...nativeEntries, ...connections] })
+      const body = c.req.valid("json")
+      const updatedByName = resolvePolicyEditorLabel(payload, payload.currentMember.id)
+      const policy: ExternalMcpToolPolicy = {
+        version: 1,
+        allDisabled: body.allDisabled,
+        disabledTools: [...new Set(body.disabledTools)],
+        updatedByOrgMembershipId: payload.currentMember.id,
+        ...(updatedByName ? { updatedByName } : {}),
+        updatedAt: new Date().toISOString(),
+      }
+      await setExternalMcpConnectionToolPolicy(
+        connection.id,
+        payload.organization.id,
+        policy,
+      )
+      return c.json({ policy: toToolPolicyResponse(policy, { includeAttribution: true }) })
     },
   )
 
@@ -1597,6 +1859,9 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       if (!connection) {
         return c.json({ error: "connection_not_found", message: "Unknown connection." }, 404)
       }
+      if (connection.kind !== "external_mcp") {
+        return c.json({ error: "invalid_request", message: "Native provider connectors do not expose an MCP tool catalog." }, 400)
+      }
 
       const isAdmin = verifyOrgRole({ roles: ["admin"], userContext: payload.currentMember })
       if (!isAdmin) {
@@ -1623,7 +1888,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       try {
         const tools = await listExternalMcpTools(
           connection,
-          callbackRedirectUri(connection),
+          await callbackRedirectUri(connection),
           credential.member,
           c.get("requestId"),
         )
@@ -1644,10 +1909,94 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
               },
             } : {}),
           })),
+          policy: toToolPolicyResponse(connection.toolPolicy, { includeAttribution: isAdmin }),
         })
       } catch (error) {
         const diagnostic = externalMcpDiagnosticForResponse(error, c.get("requestId"), "MCP_TOOL_DISCOVERY")
         logger.error("external_mcp_tool_catalog_failed", {
+          connection_id: connection.id,
+          organization_id: payload.organization.id,
+          connection_endpoint: safeExternalMcpEndpointForLog(connection.url),
+          ...externalMcpDiagnosticForLog(error, c.get("requestId"), "MCP_TOOL_DISCOVERY"),
+        })
+        return c.json({
+          error: "tool_catalog_failed",
+          message: `Could not inspect "${connection.name}": ${diagnostic.message} Reference: ${diagnostic.referenceId}.`,
+          diagnostic,
+        }, 502)
+      }
+    },
+  )
+
+  app.get(
+    "/v1/mcp-connections/:connectionId/mcp-apps",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "List MCP Apps exposed by an External MCP Connection",
+      description: "Enumerates the connection's app-visible MCP App launch tools in the exact reference shape desktop dashboard tiles use, so organization Dashboards can add them as elements. Admin-only.",
+      responses: {
+        200: jsonResponse("MCP Apps available from this connection.", connectionMcpAppListResponseSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        403: jsonResponse("Only workspace owners and admins can list connection MCP Apps.", forbiddenSchema),
+        404: jsonResponse("Unknown connection.", connectionNotFoundSchema),
+        409: jsonResponse("The connection has no usable credential for this member.", connectionNotReadySchema),
+        502: jsonResponse("The upstream MCP tool catalog could not be read.", connectionToolListFailedSchema),
+      },
+    }),
+    orgRoleRoute(["admin"]),
+    paramValidator(connectionParamsSchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const { connectionId } = c.req.valid("param")
+      const externalMcpConnectionId = normalizeDenTypeId("externalMcpConnection", connectionId)
+      const connection = await getExternalMcpConnection({
+        organizationId: payload.organization.id,
+        connectionId: externalMcpConnectionId,
+      })
+      if (!connection) {
+        return c.json({ error: "connection_not_found", message: "Unknown connection." }, 404)
+      }
+      if (connection.kind !== "external_mcp") {
+        return c.json({ error: "invalid_request", message: "Native provider connectors do not expose MCP Apps." }, 400)
+      }
+
+      const credential = await resolveExternalMcpToolCredential(connection, payload.currentMember.id)
+      if (!credential.ok) {
+        return c.json({
+          error: "connection_not_ready",
+          message: credential.message,
+        }, 409)
+      }
+
+      try {
+        const tools = await listExternalMcpTools(
+          connection,
+          await callbackRedirectUri(connection),
+          credential.member,
+          c.get("requestId"),
+        )
+        const serverName = connectMcpAppHostServerName(connection.id)
+        const apps = tools.flatMap((tool) => {
+          if (PROXY_GATEWAY_TOOL_NAMES.has(tool.name)) return []
+          if (evaluateToolPolicy(connection.toolPolicy, tool.name).blocked) return []
+          const resourceUri = externalMcpAppResourceUri(tool)
+          if (!resourceUri || !mcpToolVisibleToApp(tool)) return []
+          return [{
+            serverName,
+            connectionId: connection.id,
+            toolName: tool.name,
+            projectedToolName: projectedMcpToolName(serverName, tool.name),
+            resourceUri,
+            title: typeof tool.title === "string" && tool.title.trim() ? tool.title : tool.annotations?.title ?? null,
+            description: typeof tool.description === "string" ? tool.description : null,
+            requiresInput: mcpToolRequiresInput(tool),
+            requiresApproval: tool.annotations?.readOnlyHint !== true || tool.annotations?.destructiveHint === true,
+          }]
+        })
+        return c.json({ apps })
+      } catch (error) {
+        const diagnostic = externalMcpDiagnosticForResponse(error, c.get("requestId"), "MCP_TOOL_DISCOVERY")
+        logger.error("external_mcp_app_list_failed", {
           connection_id: connection.id,
           organization_id: payload.organization.id,
           connection_endpoint: safeExternalMcpEndpointForLog(connection.url),
@@ -1672,7 +2021,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         200: jsonResponse("The MCP tool completed.", connectionToolRunResponseSchema),
         400: jsonResponse("Invalid tool name or arguments.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
-        403: jsonResponse("The caller must be a workspace owner/admin and have access to this connection.", forbiddenSchema),
+        403: jsonResponse("The caller must be a workspace owner/admin, have access, and be allowed by tool policy.", connectionToolRunForbiddenSchema),
         404: jsonResponse("Unknown connection.", connectionNotFoundSchema),
         409: jsonResponse("The connection has no usable credential for this member.", connectionNotReadySchema),
         413: jsonResponse("The tool arguments exceeded the request size limit.", connectionToolRequestTooLargeSchema),
@@ -1702,6 +2051,9 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       if (!connection) {
         return c.json({ error: "connection_not_found", message: "Unknown connection." }, 404)
       }
+      if (connection.kind !== "external_mcp") {
+        return c.json({ error: "invalid_request", message: "Native provider connectors do not expose MCP tools." }, 400)
+      }
 
       const memberTeams: MemberTeamSummary[] = c.get("memberTeams") ?? []
       const canUse = memberFacingMcpConnectionsEnabled(payload.organization.metadata, { gatingEnabled: env.mcpConnectionsGatingEnabled })
@@ -1722,11 +2074,21 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         }, 409)
       }
 
+      const policyDecision = evaluateToolPolicy(connection.toolPolicy, toolName)
+      if (policyDecision.blocked) {
+        return c.json({
+          error: "policy_blocked",
+          message: `${toolName} is disabled for your organization.`,
+          disabledBy: policyDecision.disabledBy ?? null,
+          disabledAt: policyDecision.disabledAt ?? null,
+        }, 403)
+      }
+
       const startedAt = Date.now()
       try {
         const inspected = await inspectExternalMcpToolCall({
           connection,
-          redirectUri: callbackRedirectUri(connection),
+          redirectUri: await callbackRedirectUri(connection),
           toolName,
           args: toolArguments,
           member: credential.member,
@@ -1799,6 +2161,47 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
 
       const body = c.req.valid("json")
       const sessionId = c.get("session")?.id
+      if (body.kind === "native_provider") {
+        if (isAgentOAuthClientConnection({ oauthClient: body.oauthClient, sessionId })) {
+          return c.json({ error: "invalid_request", message: "OAuth client credentials cannot be set from the agent. Add them in the OpenWork Cloud dashboard under Extensions." }, 400)
+        }
+        const provider = getNativeOAuthProvider(body.nativeProviderKey)
+        if (!provider) {
+          return c.json({ error: "invalid_request", message: `"${body.nativeProviderKey}" is not a known native OAuth provider.` }, 400)
+        }
+        const unknownFeatures = (body.oauthClient.features ?? []).filter((feature) => !Object.hasOwn(provider.optionalFeatures ?? {}, feature))
+        if (unknownFeatures.length > 0) {
+          return c.json({ error: "invalid_request", message: `Unknown optional feature(s): ${unknownFeatures.join(", ")}.` }, 400)
+        }
+        const created = await createExternalMcpConnection({
+          organizationId: payload.organization.id,
+          name: body.name,
+          url: provider.websiteUrl,
+          authType: "oauth",
+          kind: "native_provider",
+          nativeProviderKey: provider.providerId,
+          credentialMode: "per_member",
+          createdByOrgMembershipId: payload.currentMember.id,
+          access: { orgWide: true, memberIds: [], teamIds: [] },
+        })
+        await upsertOrgOAuthClient({
+          organizationId: payload.organization.id,
+          providerId: created.id,
+          clientId: body.oauthClient.clientId,
+          clientSecret: body.oauthClient.clientSecret ?? null,
+          ...(body.oauthClient.features ? { extra: { features: body.oauthClient.features } } : {}),
+          createdByOrgMembershipId: payload.currentMember.id,
+        })
+        const response = await toConnectionResponse(created, {
+          callerOrgMembershipId: payload.currentMember.id,
+          createdByName: resolveCreatorName(payload, created.createdByOrgMembershipId),
+          includeAccess: true,
+          requiredBy: [],
+          identityManagedBy: [],
+          requiredAuthTypes: new Set(),
+        })
+        return c.json({ ...response, links: memberConnectLinks(created) })
+      }
       // Secrets must not travel through chat transcripts: when the caller is
       // the agent (internal MCP principal), refuse API-key connections.
       if (isAgentOAuthClientConnection({ oauthClient: body.oauthClient, sessionId })) {
@@ -1810,7 +2213,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       if (body.oauthClient && body.authType !== "oauth") {
         return c.json({ error: "invalid_request", message: "oauthClient is only allowed when authType is oauth." }, 400)
       }
-      if (body.authType !== "oauth" && (body.authorizationServerIssuer !== undefined || body.requestedScopes.length > 0)) {
+      if (body.authType !== "oauth" && (body.authorizationServerIssuer !== undefined || (body.requestedScopes?.length ?? 0) > 0)) {
         return c.json({ error: "invalid_request", message: "OAuth issuer and scopes are only allowed when authType is oauth." }, 400)
       }
       if (body.authType === "apikey" && !body.apiKey) {
@@ -1829,6 +2232,11 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         }
       }
 
+      const oauthConfiguration = externalMcpOAuthConfigurationDefaults({
+        url: body.url,
+        authorizationServerIssuer: body.authorizationServerIssuer,
+        requestedScopes: body.requestedScopes,
+      })
       const created = await createExternalMcpConnection({
         organizationId: payload.organization.id,
         name: body.name,
@@ -1838,8 +2246,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         apiKey: body.apiKey ?? null,
         oauthConfiguration: body.authType === "oauth" ? {
           version: 1,
-          authorizationServerIssuer: body.authorizationServerIssuer ?? null,
-          requestedScopes: [...new Set(body.requestedScopes)],
+          ...oauthConfiguration,
         } : null,
         createdByOrgMembershipId: payload.currentMember.id,
         access: {
@@ -1860,7 +2267,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
             enterpriseMcpRegistrationSource: "pre-registered",
             registrationContractVersion: 2,
             registeredRedirectUri: externalMcpCallbackUrl({ connectionId: created.id, callbackMode }),
-            authorizationServerIssuer: body.authorizationServerIssuer ?? undefined,
+            authorizationServerIssuer: oauthConfiguration.authorizationServerIssuer ?? undefined,
             tokenEndpointAuthMethod: body.oauthClient.tokenEndpointAuthMethod,
           },
           createdByOrgMembershipId: payload.currentMember.id,
@@ -1870,7 +2277,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       if (body.authType !== "oauth") {
         // No OAuth dance needed — validate the server is real and reachable now.
         try {
-          await connectExternalMcp(created, callbackRedirectUri(created), undefined, undefined, c.get("requestId"))
+          await connectExternalMcp(created, await callbackRedirectUri(created), undefined, undefined, c.get("requestId"))
           // OAuth records a successful connection while persisting tokens.
           // A no-auth server has no token write, so retain the successful
           // initialize probe explicitly for readiness and catalog discovery.
@@ -1959,6 +2366,19 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       const identityChanged = normalizeExternalMcpIdentityUrl(connection.url) !== normalizeExternalMcpIdentityUrl(body.url)
         || connection.authType !== body.authType
         || connection.credentialMode !== body.credentialMode
+      const oauthConfigurationDefaults = externalMcpOAuthConfigurationDefaults({
+        url: body.url,
+        authorizationServerIssuer: body.authorizationServerIssuer !== undefined
+          ? body.authorizationServerIssuer
+          : !identityChanged && connection.authType === "oauth"
+            ? connection.oauthConfiguration?.authorizationServerIssuer ?? undefined
+            : undefined,
+        requestedScopes: body.requestedScopes
+          ?? (!identityChanged && connection.authType === "oauth"
+            && connection.oauthConfiguration?.requestedScopes.length
+            ? connection.oauthConfiguration.requestedScopes
+            : undefined),
+      })
       const shouldWriteOAuthConfiguration = body.authType !== "oauth"
         || connection.authType !== "oauth"
         || connection.oauthConfiguration !== null
@@ -1969,12 +2389,8 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         : body.authType === "oauth"
           ? {
               version: 1,
-              authorizationServerIssuer: body.authorizationServerIssuer !== undefined
-                ? body.authorizationServerIssuer
-                : connection.authType === "oauth"
-                  ? connection.oauthConfiguration?.authorizationServerIssuer ?? null
-                  : null,
-              requestedScopes: [...new Set(body.requestedScopes ?? connection.oauthConfiguration?.requestedScopes ?? [])],
+              authorizationServerIssuer: oauthConfigurationDefaults.authorizationServerIssuer,
+              requestedScopes: oauthConfigurationDefaults.requestedScopes,
               ...(connection.authType === "oauth" && connection.oauthConfiguration?.discovery
                 ? { discovery: connection.oauthConfiguration.discovery }
                 : {}),
@@ -2073,7 +2489,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         try {
           await connectExternalMcp(
             proposedConnection,
-            callbackRedirectUri(proposedConnection),
+            await callbackRedirectUri(proposedConnection),
             undefined,
             undefined,
             c.get("requestId"),
@@ -2377,6 +2793,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       }
 
       const callerIsAdmin = verifyOrgRole({ roles: ["admin"], userContext: payload.currentMember })
+      const memberTeams: MemberTeamSummary[] = c.get("memberTeams") ?? []
       if (connection.credentialMode === "shared") {
         // Connecting a shared credential IS the org-level integration setup —
         // admin-only, like creating the connection itself.
@@ -2385,7 +2802,6 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
       } else {
         // Per-member: any member GRANTED the connection may connect their own
         // account (that is the whole point); admins may too.
-        const memberTeams: MemberTeamSummary[] = c.get("memberTeams") ?? []
         const canUse = await memberCanUseExternalMcpConnection({
           connectionId: externalMcpConnectionId,
           orgMembershipId: payload.currentMember.id,
@@ -2394,6 +2810,34 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
         if (!canUse && !callerIsAdmin) {
           return c.json({ error: "forbidden", message: "You have not been granted access to this connection." }, 403)
         }
+      }
+
+      if (connection.kind === "native_provider") {
+        if (!connection.nativeProviderKey) {
+          return c.json({ error: "invalid_request", message: "Native provider connector configuration is incomplete." }, 409)
+        }
+        const provider = getNativeOAuthProvider(connection.nativeProviderKey)
+        if (!provider) {
+          return c.json({ error: "invalid_request", message: "Native provider connector configuration is not supported." }, 409)
+        }
+        const started = await beginNativeProviderConnect({
+          provider,
+          credentialProviderId: connection.id,
+          organizationId: payload.organization.id,
+          orgMembershipId: payload.currentMember.id,
+          request: c.req.raw,
+          teamIds: memberTeams.map((team) => team.id),
+        })
+        if ("error" in started) {
+          if (started.error === "forbidden") {
+            return c.json({ error: "forbidden", message: "You have not been granted access to this connection." }, 403)
+          }
+          if (started.error === "client_configuration_invalid") {
+            return c.json({ error: "invalid_request", message: started.message ?? "OAuth client configuration is incomplete." }, 400)
+          }
+          return c.json({ error: "connection_not_found", message: "This connector does not have an OAuth client configured." }, 404)
+        }
+        return c.json({ status: "needs_auth", authorizeUrl: started.authorizeUrl })
       }
 
       let issuerRepairRequiresAdmin = false
@@ -2424,7 +2868,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
           })
           const result = await connectExternalMcp(
             target,
-            callbackRedirectUri(target),
+            await callbackRedirectUri(target),
             signedState,
             member,
             c.get("requestId"),
@@ -2437,9 +2881,33 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
           }
         }
 
+        const beginAuthorizationWithConfigurationRefresh = async (target: ExternalMcpConnectionRow) => {
+          try {
+            const started = await beginAuthorization(target)
+            connection = target
+            return started
+          } catch (error) {
+            const diagnostic = externalMcpDiagnosticForResponse(error, c.get("requestId"), "AUTH_CLIENT_REGISTRATION")
+            if (diagnostic.code !== "MCP_OAUTH_CONFIGURATION_CHANGED") throw error
+            const refreshed = await getExternalMcpConnection({
+              organizationId: payload.organization.id,
+              connectionId: externalMcpConnectionId,
+            })
+            if (!refreshed || externalMcpIdentityBinding(refreshed) !== externalMcpIdentityBinding(target)) {
+              throw error
+            }
+            connection = refreshed
+            logger.info("external_mcp_oauth_configuration_change_retried", {
+              connection_id: refreshed.id,
+              organization_id: payload.organization.id,
+            })
+            return beginAuthorization(refreshed)
+          }
+        }
+
         let started: Awaited<ReturnType<typeof beginAuthorization>>
         try {
-          started = await beginAuthorization(connection)
+          started = await beginAuthorizationWithConfigurationRefresh(connection)
         } catch (error) {
           const diagnostic = externalMcpDiagnosticForResponse(error, c.get("requestId"), "AUTH_RESOURCE_DISCOVERY")
           const configuredIssuer = connection.oauthConfiguration?.authorizationServerIssuer
@@ -2501,7 +2969,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
             previous_authorization_server_issuer: configuredIssuer,
             authorization_server_issuer: replacementIssuer,
           })
-          started = await beginAuthorization(connection)
+          started = await beginAuthorizationWithConfigurationRefresh(connection)
         }
         if (started.result.status === "needs_auth" && connection.oauthConfiguration?.callbackMode === "shared-v1") {
           const discovered = await getExternalMcpConnection({
@@ -2515,10 +2983,11 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
               || started.authorizationResponseIssuerRequired !== discoveredResponseIssuerRequired
             if (signedBindingChanged) {
               await abandonExternalMcpAuth(discovered, started.signedState, member, c.get("requestId"))
-              started = await beginAuthorization(discovered)
+              started = await beginAuthorizationWithConfigurationRefresh(discovered)
+            } else {
+              connection = discovered
             }
-            connection = discovered
-            if (usesPinnedSharedOAuthCallback(discovered)) {
+            if (usesPinnedSharedOAuthCallback(connection)) {
               logger.info("external_mcp_oauth_pinned_shared_callback_selected", {
                 connection_id: connection.id,
                 organization_id: payload.organization.id,
@@ -2545,7 +3014,7 @@ export function registerMcpConnectionRoutes<T extends { Variables: OrgRouteVaria
           return c.json({
             error: "mcp_oauth_configuration_required",
             message: "This authorization server requires a pre-registered OAuth client before OpenWork can connect.",
-            callbackUrl: callbackRedirectUri(connection),
+            callbackUrl: await callbackRedirectUri(connection),
             clientMetadataUrl: externalMcpClientMetadataUrl(),
             manualRequirements: [
               "Create an OAuth application in the external provider.",

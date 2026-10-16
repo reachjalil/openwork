@@ -20,13 +20,16 @@ import {
   createDenClient,
   DenApiError,
   ensureDenActiveOrganization,
+  getDenDesktopConfigCacheKey,
   normalizeDenDesktopConfig,
+  readCachedDenDesktopConfig,
   readDenBootstrapConfig,
   readDenSettings,
   setDenBootstrapConfig,
+  writeCachedDenDesktopConfig,
   type DenDesktopConfig,
 } from "../../../app/lib/den";
-import { applyBrandAppName, applyBrandIcon } from "../../../app/lib/desktop";
+import { applyBrandAppName, applyBrandIcon, getBrandIconState } from "../../../app/lib/desktop";
 import { createOpenworkServerClient } from "../../../app/lib/openwork-server";
 import {
   denSessionUpdatedEvent,
@@ -34,15 +37,23 @@ import {
 } from "../../../app/lib/den-session-events";
 import { isDesktopRuntime } from "../../../app/lib/runtime-env";
 import { resolveOpenworkConnection } from "../../shell/openwork-connection";
+import {
+  createConnectPolicyReconciler,
+  type ConnectPolicyReconciler,
+  type ConnectPolicySyncState,
+  type ConnectPolicyTarget,
+} from "./connect-policy-reconciler";
 import { useDenAuth } from "./den-auth-provider";
 import {
   bootstrapBrandingFromDesktopConfig,
   bootstrapBrandingNeedsSync,
+  brandIconReconcileAction,
 } from "./workspace-branding-restart";
 
 export type DesktopConfigStore = {
   config: DenDesktopConfig;
   loading: boolean;
+  freshConfigStatus: "pending" | "ready" | "failed";
   refresh: () => Promise<void>;
   refreshFresh: () => Promise<DenDesktopConfig>;
   /**
@@ -51,6 +62,12 @@ export type DesktopConfigStore = {
    * from non-hook code paths.
    */
   checkRestriction: DesktopAppRestrictionChecker;
+  /**
+   * Sanitized convergence state of the organization Connect policy against
+   * the local runtime. Informational only — nothing gates on it, so local
+   * work continues while reconciliation is pending or stalled.
+   */
+  connectPolicySync: ConnectPolicySyncState;
 };
 
 const DesktopConfigContext = createContext<DesktopConfigStore | undefined>(
@@ -59,7 +76,6 @@ const DesktopConfigContext = createContext<DesktopConfigStore | undefined>(
 
 const DEFAULT_DESKTOP_CONFIG: DenDesktopConfig = {};
 const DESKTOP_CONFIG_REFRESH_MS = 60 * 60 * 1000;
-const DESKTOP_CONFIG_CACHE_PREFIX = "openwork.den.desktopConfig:";
 const DESKTOP_CONFIG_ITEMS = [
   ...desktopPolicyKeys,
   "allowedDesktopVersions",
@@ -67,10 +83,42 @@ const DESKTOP_CONFIG_ITEMS = [
   "brandLogoUrl",
   "brandIconUrl",
   "brandAccentColor",
+  "automationsEnabled",
+  "dashboardEnabled",
   "connectEnabled",
   "onboardingPrompts",
   "onboardingPromptDescriptions",
 ] as const satisfies readonly (keyof DenDesktopConfig)[];
+
+export function resolveConnectStateToPush(config: DenDesktopConfig): boolean | null {
+  return typeof config.connectEnabled === "boolean" ? config.connectEnabled : null;
+}
+
+/**
+ * Resolve the current local-runtime target for the Connect policy. The target
+ * key identifies one runtime lifetime: the desktop bridge reports a monotonic
+ * per-start generation (ports and tokens are sticky across restarts), so
+ * after a restart or a workspace switch the key changes and the policy must
+ * be reapplied to the new generation.
+ */
+export async function resolveConnectPolicyTarget(): Promise<ConnectPolicyTarget | null> {
+  const connection = await resolveOpenworkConnection();
+  if (!connection.normalizedBaseUrl || !connection.resolvedHostToken) return null;
+  const { normalizedBaseUrl, resolvedToken, resolvedHostToken } = connection;
+  // The desktop runtime reports a monotonic per-start generation; remote or
+  // stored connections identify a lifetime by URL and host token instead.
+  const generation = connection.hostInfo?.generation ?? null;
+  return {
+    key: `${normalizedBaseUrl}\u0000${resolvedHostToken}\u0000${generation ?? ""}`,
+    apply: async (connectEnabled) => {
+      await createOpenworkServerClient({
+        baseUrl: normalizedBaseUrl,
+        token: resolvedToken,
+        hostToken: resolvedHostToken,
+      }).setConnectState(connectEnabled);
+    },
+  };
+}
 
 type DesktopConfigItem = (typeof DESKTOP_CONFIG_ITEMS)[number];
 type DesktopConfigAction = {
@@ -81,38 +129,6 @@ type DesktopConfigAction = {
 
 function isBootstrapBrandingActionItem(item: DesktopConfigItem): boolean {
   return item === "brandAppName" || item === "brandLogoUrl" || item === "brandIconUrl";
-}
-
-function getDesktopConfigCacheKey(): string {
-  const settings = readDenSettings();
-  const baseUrl = settings.baseUrl.trim();
-  const activeOrgId = settings.activeOrgId?.trim() ?? "";
-  if (!baseUrl) return "";
-  return `${DESKTOP_CONFIG_CACHE_PREFIX}${baseUrl}::${activeOrgId}`;
-}
-
-function readCachedDesktopConfig(key: string): DenDesktopConfig | null {
-  if (typeof window === "undefined" || !key) return null;
-
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return null;
-    return normalizeDenDesktopConfig(JSON.parse(raw));
-  } catch {
-    return null;
-  }
-}
-
-function writeCachedDesktopConfig(key: string, config: DenDesktopConfig) {
-  if (typeof window === "undefined" || !key) return;
-  try {
-    window.localStorage.setItem(
-      key,
-      JSON.stringify(normalizeDenDesktopConfig(config)),
-    );
-  } catch {
-    // Quota / private-browsing failures are non-fatal — we just miss the cache next boot.
-  }
 }
 
 function desktopConfigItemMatches(
@@ -146,9 +162,48 @@ type DesktopConfigProviderProps = {
   children: ReactNode;
 };
 
+// Rewrites desktop-bootstrap.json branding to match `normalizedConfig` so a
+// cleared wordmark/icon cannot resurrect from the install/connect snapshot on
+// the next relaunch. No-op when the bootstrap already matches.
+function syncBootstrapBranding(normalizedConfig: DenDesktopConfig): void {
+  if (!isDesktopRuntime()) return;
+  const bootstrap = readDenBootstrapConfig();
+  if (!bootstrapBrandingNeedsSync(bootstrap, normalizedConfig)) return;
+  const branding = bootstrapBrandingFromDesktopConfig(normalizedConfig);
+  void setDenBootstrapConfig(
+    {
+      ...bootstrap,
+      brandAppName: branding.brandAppName,
+      brandLogoUrl: branding.brandLogoUrl,
+      brandIconUrl: branding.brandIconUrl,
+    },
+    { dispatchSettingsChanged: false },
+  ).catch(() => undefined);
+}
+
+// Level-based safety net behind the edge-triggered config diff: the shell
+// (Electron main) restores its cached/bootstrap brand icon on every launch,
+// so when a clear's edge is missed (stale localStorage cache, failed IPC,
+// org/base-URL switch changing the cache key), nothing would ever tell the
+// shell to reset and the branded icon would persist forever. After every
+// fresh config fetch, compare the shell's applied state to the config and
+// re-assert the expected icon plus the bootstrap branding snapshot.
+async function reconcileShellBranding(latestConfig: DenDesktopConfig): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const normalizedConfig = normalizeDenDesktopConfig(latestConfig);
+  syncBootstrapBranding(normalizedConfig);
+  const action = brandIconReconcileAction(normalizedConfig, await getBrandIconState());
+  if (!action) return;
+  const result = await applyBrandIcon(action.apply);
+  if (!result.ok) {
+    console.warn(`[brand-icon] Desktop icon reconcile was not applied: ${result.reason ?? "unknown failure"}`);
+  }
+}
+
 type DesktopConfigState = {
   config: DenDesktopConfig;
   loading: boolean;
+  freshConfigStatus: "pending" | "ready" | "failed";
 };
 
 /**
@@ -166,13 +221,15 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
   const [desktopConfigState, setDesktopConfigState] = useState<DesktopConfigState>({
     config: DEFAULT_DESKTOP_CONFIG,
     loading: true,
+    freshConfigStatus: "pending",
   });
-  const { config, loading } = desktopConfigState;
+  const { config, freshConfigStatus, loading } = desktopConfigState;
   // Bumped whenever the browser tells us the Den session or settings changed.
   const [settingsVersion, bumpSettingsVersion] = useReducer((value: number) => value + 1, 0);
   // Monotonic run id — same guard-against-stale-resolution pattern as DenAuthProvider.
   const refreshRunRef = useRef(0);
-  const lastPushedConnectEnabledRef = useRef<boolean | null>(null);
+  const connectPolicyReconcilerRef = useRef<ConnectPolicyReconciler | null>(null);
+  const [connectPolicySync, setConnectPolicySync] = useState<ConnectPolicySyncState>({ state: "idle" });
   // Safe in-memory copy of the last config we actually applied. State drives
   // rendering, while this ref lets the handler compare without stale closures.
   const currentDesktopConfigRef = useRef<DenDesktopConfig>(DEFAULT_DESKTOP_CONFIG);
@@ -213,20 +270,8 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
     const shouldSyncBootstrapBranding = actions.some((action) =>
       isBootstrapBrandingActionItem(action.item),
     );
-    if (shouldSyncBootstrapBranding && isDesktopRuntime()) {
-      const bootstrap = readDenBootstrapConfig();
-      if (bootstrapBrandingNeedsSync(bootstrap, normalizedConfig)) {
-        const branding = bootstrapBrandingFromDesktopConfig(normalizedConfig);
-        void setDenBootstrapConfig(
-          {
-            ...bootstrap,
-            brandAppName: branding.brandAppName,
-            brandLogoUrl: branding.brandLogoUrl,
-            brandIconUrl: branding.brandIconUrl,
-          },
-          { dispatchSettingsChanged: false },
-        ).catch(() => undefined);
-      }
+    if (shouldSyncBootstrapBranding) {
+      syncBootstrapBranding(normalizedConfig);
     }
 
     currentDesktopConfigRef.current = normalizedConfig;
@@ -241,6 +286,8 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
     if (import.meta.env.DEV && requireFresh && devRefreshDesktopConfigRef.current) {
       const nextConfig = devRefreshDesktopConfigRef.current;
       applyDesktopConfigActions(nextConfig);
+      setDesktopConfigState((current) => ({ ...current, freshConfigStatus: "ready" }));
+      void reconcileShellBranding(nextConfig).catch(() => undefined);
       return nextConfig;
     }
 
@@ -248,15 +295,19 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
     const settings = readDenSettings();
     const token = settings.authToken?.trim() ?? "";
     const activeOrgId = settings.activeOrgId?.trim() ?? "";
-    const cacheKey = getDesktopConfigCacheKey();
+    const cacheKey = getDenDesktopConfigCacheKey();
 
     if (!isSignedIn || !token || !activeOrgId) {
       applyDesktopConfigActions(DEFAULT_DESKTOP_CONFIG);
-      setDesktopConfigState((current) => ({ ...current, loading: false }));
+      setDesktopConfigState((current) => ({
+        ...current,
+        freshConfigStatus: "failed",
+        loading: false,
+      }));
       return DEFAULT_DESKTOP_CONFIG;
     }
 
-    const cached = readCachedDesktopConfig(cacheKey);
+    const cached = readCachedDenDesktopConfig(cacheKey);
     if (cached) {
       applyDesktopConfigActions(cached);
     }
@@ -273,8 +324,10 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
 
       if (currentRun !== refreshRunRef.current) return nextConfig;
 
-      writeCachedDesktopConfig(cacheKey, nextConfig);
+      writeCachedDenDesktopConfig(cacheKey, nextConfig);
       applyDesktopConfigActions(nextConfig);
+      setDesktopConfigState((current) => ({ ...current, freshConfigStatus: "ready" }));
+      void reconcileShellBranding(nextConfig).catch(() => undefined);
       return nextConfig;
     } catch (error) {
       if (currentRun !== refreshRunRef.current) {
@@ -296,6 +349,7 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
 
       const fallbackConfig = cached ?? DEFAULT_DESKTOP_CONFIG;
       applyDesktopConfigActions(fallbackConfig);
+      setDesktopConfigState((current) => ({ ...current, freshConfigStatus: "failed" }));
       if (requireFresh) throw error;
       return fallbackConfig;
     } finally {
@@ -323,18 +377,35 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
     // settingsVersion is read to tie this effect to settings-change events.
     void settingsVersion;
 
-    if (!isSignedIn) {
-      applyDesktopConfigActions(DEFAULT_DESKTOP_CONFIG);
-      setDesktopConfigState((current) => ({ ...current, loading: false }));
+    if (denAuth.status === "checking") {
+      setDesktopConfigState((current) => ({
+        ...current,
+        freshConfigStatus: "pending",
+        loading: true,
+      }));
       return;
     }
 
-    const cacheKey = getDesktopConfigCacheKey();
-    const cached = readCachedDesktopConfig(cacheKey);
+    if (!isSignedIn) {
+      applyDesktopConfigActions(DEFAULT_DESKTOP_CONFIG);
+      setDesktopConfigState((current) => ({
+        ...current,
+        freshConfigStatus: "failed",
+        loading: false,
+      }));
+      return;
+    }
+
+    const cacheKey = getDenDesktopConfigCacheKey();
+    const cached = readCachedDenDesktopConfig(cacheKey);
     applyDesktopConfigActions(cached ?? DEFAULT_DESKTOP_CONFIG);
-    setDesktopConfigState((current) => ({ ...current, loading: !cached }));
+    setDesktopConfigState((current) => ({
+      ...current,
+      freshConfigStatus: "pending",
+      loading: !cached,
+    }));
     void desktopConfigHandler();
-  }, [applyDesktopConfigActions, desktopConfigHandler, isSignedIn, settingsVersion]);
+  }, [applyDesktopConfigActions, denAuth.status, desktopConfigHandler, isSignedIn, settingsVersion]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -349,6 +420,11 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
     const interval = window.setInterval(() => {
       if (!isSignedIn) return;
       void desktopConfigHandler();
+      // Level-based safety net behind the event-driven reconciler: if a
+      // runtime-generation observation was ever missed, the hourly tick
+      // re-checks convergence (one target resolution; no request when the
+      // recorded tuple already matches).
+      connectPolicyReconcilerRef.current?.notifyTargetChanged();
     }, DESKTOP_CONFIG_REFRESH_MS);
 
     return () => {
@@ -358,28 +434,47 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
     };
   }, [desktopConfigHandler, isSignedIn]);
 
-  const connectEnabled = config.connectEnabled === true;
+  const connectEnabled = resolveConnectStateToPush(config);
 
+  // Reconciler lifecycle: created once per mount and rearmed by runtime
+  // observations. Every renderer path that (re)publishes the local server —
+  // boot, engine reload, workspace reconnect, debug restart — dispatches
+  // "openwork-server-settings-changed", which is the runtime-generation
+  // observation channel.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const reconciler = createConnectPolicyReconciler({
+      resolveTarget: resolveConnectPolicyTarget,
+      wait: (delayMs) => new Promise((resolveWait) => window.setTimeout(resolveWait, delayMs)),
+      onStateChange: setConnectPolicySync,
+    });
+    connectPolicyReconcilerRef.current = reconciler;
+    const handleRuntimeChanged = () => reconciler.notifyTargetChanged();
+    window.addEventListener("openwork-server-settings-changed", handleRuntimeChanged);
+    return () => {
+      window.removeEventListener("openwork-server-settings-changed", handleRuntimeChanged);
+      reconciler.dispose();
+      if (connectPolicyReconcilerRef.current === reconciler) {
+        connectPolicyReconcilerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Desired-state feed: reconcile whenever the effective Connect policy or
+  // its source (the active organization) changes. `settingsVersion` ties this
+  // to Den session/settings events so an organization switch re-reconciles
+  // even when both organizations desire the same switch value.
   useEffect(() => {
     if (loading) return;
-    if (lastPushedConnectEnabledRef.current === connectEnabled) return;
-    let cancelled = false;
-
-    void (async () => {
-      const connection = await resolveOpenworkConnection();
-      if (cancelled || !connection.normalizedBaseUrl || !connection.resolvedHostToken) return;
-      lastPushedConnectEnabledRef.current = connectEnabled;
-      await createOpenworkServerClient({
-        baseUrl: connection.normalizedBaseUrl,
-        token: connection.resolvedToken,
-        hostToken: connection.resolvedHostToken,
-      }).setConnectState(connectEnabled);
-    })().catch(() => null);
-
-    return () => {
-      cancelled = true;
-    };
-  }, [connectEnabled, loading]);
+    const reconciler = connectPolicyReconcilerRef.current;
+    if (!reconciler) return;
+    if (connectEnabled === null) {
+      reconciler.setDesired(null);
+      return;
+    }
+    const activeOrgId = readDenSettings().activeOrgId?.trim() ?? "";
+    reconciler.setDesired({ connectEnabled, revision: activeOrgId });
+  }, [connectEnabled, loading, settingsVersion]);
 
   // Dev-only: expose a bridge so evals can inject config directly without
   // requiring a cloud sign-in. This simply applies the config to React state.
@@ -409,8 +504,16 @@ export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) 
     // recent org restrictions without having to recompute every render.
     const checkRestriction: DesktopAppRestrictionChecker = ({ restriction }) =>
       checkDesktopAppRestriction({ config, restriction });
-    return { config, loading, refresh, refreshFresh, checkRestriction };
-  }, [config, loading, refresh, refreshFresh]);
+    return {
+      config,
+      freshConfigStatus,
+      loading,
+      refresh,
+      refreshFresh,
+      checkRestriction,
+      connectPolicySync,
+    };
+  }, [config, freshConfigStatus, loading, refresh, refreshFresh, connectPolicySync]);
 
   return (
     <DesktopConfigContext.Provider value={value}>

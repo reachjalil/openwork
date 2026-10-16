@@ -87,6 +87,14 @@ export type DesktopIntegrationResult = {
 
 export type OpenworkServerInfo = {
   running: boolean;
+  /**
+   * Monotonic per-start identity of the embedded server within this desktop
+   * process. Sticky ports and persisted tokens keep the connection details
+   * identical across restarts, so clients that must re-deliver state to a new
+   * server lifetime (e.g. the Connect policy) key on this value. Null when
+   * the bridge predates the field or no start completed yet.
+   */
+  generation: number | null;
   remoteAccessEnabled: boolean;
   host: string | null;
   port: number | null;
@@ -308,7 +316,7 @@ export type DesktopFetchResult = {
 export type DesktopMultipartUploadInput = {
   transferId: string;
   url: string;
-  filePath: string;
+  bytes: ArrayBuffer;
   filename: string;
   size: number;
   contentType?: string;
@@ -450,6 +458,11 @@ export type DesktopCommandMap = {
     args: [input: DesktopNotificationInput];
     result: DesktopNotificationResult;
   };
+  desktopSentrySetSession: {
+    args: [input: { userId: string; orgId: string }];
+    result: { enabled: boolean };
+  };
+  desktopSentryClearSession: { args: []; result: { enabled: boolean } };
   desktopIntegrationStatus: { args: []; result: DesktopIntegrationStatus };
   desktopIntegrationInstall: {
     args: [options?: { useExternalLauncher?: boolean }];
@@ -493,6 +506,10 @@ export type DesktopCommandMap = {
 
   // Openwork server sidecar
   openworkServerInfo: { args: []; result: OpenworkServerInfo };
+  automationRunnerConfigure: {
+    args: [configuration: { baseUrl: string; token: string; runnerId: string } | null];
+    result: { connected: boolean };
+  };
   openworkServerRestart: {
     args: [options?: Record<string, unknown>];
     result: OpenworkServerInfo;

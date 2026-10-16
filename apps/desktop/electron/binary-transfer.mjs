@@ -1,5 +1,4 @@
-import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -51,7 +50,20 @@ function boundedByteCount(value, label, { allowUndefined = false } = {}) {
   return value;
 }
 
-function remoteUrl(value) {
+function urlWithinPrefix(candidate, prefixValue) {
+  if (typeof prefixValue !== "string" || !prefixValue.trim()) return false;
+  let prefix;
+  try {
+    prefix = new URL(prefixValue.trim());
+  } catch {
+    return false;
+  }
+  if (prefix.protocol !== candidate.protocol || prefix.host !== candidate.host) return false;
+  const prefixPath = prefix.pathname.replace(/\/+$/, "");
+  return !prefixPath || candidate.pathname === prefixPath || candidate.pathname.startsWith(`${prefixPath}/`);
+}
+
+function remoteUrl(value, allowedUrlPrefixes) {
   const raw = boundedString(value, "URL", { required: true, maxLength: 8_192 });
   let parsed;
   try {
@@ -65,6 +77,12 @@ function remoteUrl(value) {
   if (["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname)) {
     throw transferError("Dedicated file transfers are only available for remote destinations.", "loopback-url");
   }
+  // The renderer never gets to pick an arbitrary destination: the URL must sit
+  // under a remote workspace endpoint the main process itself has on record.
+  const prefixes = Array.isArray(allowedUrlPrefixes) ? allowedUrlPrefixes : [];
+  if (!prefixes.some((prefixValue) => urlWithinPrefix(parsed, prefixValue))) {
+    throw transferError("URL does not belong to a connected remote workspace.", "unauthorized-url");
+  }
   return parsed.toString();
 }
 
@@ -73,27 +91,14 @@ function isInside(root, target) {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
-async function rejectSymlinkComponents(root, target, includeTarget) {
-  const relative = path.relative(root, target);
-  const components = relative ? relative.split(path.sep) : [];
-  const count = includeTarget ? components.length : Math.max(components.length - 1, 0);
-  let current = root;
-  const rootInfo = await lstat(root).catch(() => null);
-  if (!rootInfo?.isDirectory() || rootInfo.isSymbolicLink()) {
-    throw transferError("Authorized workspace root is unavailable or symbolic.", "unauthorized-path");
-  }
-  for (let index = 0; index < count; index += 1) {
-    current = path.join(current, components[index]);
-    const info = await lstat(current).catch(() => null);
-    if (!info) throw transferError("Transfer path does not exist.", "missing-path");
-    if (info.isSymbolicLink()) {
-      throw transferError("Transfer paths must not contain symbolic links.", "symlink-path");
-    }
-  }
-}
-
-async function resolveAuthorizedPath(candidateValue, rootsValue, mode) {
-  const candidateRaw = boundedString(candidateValue, mode === "read" ? "File path" : "Destination path", {
+// A download destination must sit directly inside an authorized workspace
+// root. The root itself is app-owned state that a workspace-content writer
+// cannot rename, and exclusive creation never follows a final symlink, so no
+// attacker-controllable directory component exists between this validation
+// and the exclusive open: there is no parent that could be swapped for a
+// symbolic link to redirect creation outside the workspace.
+async function resolveAuthorizedPath(candidateValue, rootsValue) {
+  const candidateRaw = boundedString(candidateValue, "Destination path", {
     required: true,
     maxLength: 32_768,
   });
@@ -102,31 +107,53 @@ async function resolveAuthorizedPath(candidateValue, rootsValue, mode) {
   }
   const candidate = path.resolve(candidateRaw);
   const roots = Array.isArray(rootsValue) ? rootsValue : [];
+  let insideNestedOnly = false;
   for (const rootValue of roots) {
     if (typeof rootValue !== "string" || !path.isAbsolute(rootValue)) continue;
     const root = path.resolve(rootValue);
     if (!isInside(root, candidate)) continue;
-    await rejectSymlinkComponents(root, candidate, mode === "read");
+    if (candidate === root || path.dirname(candidate) !== root) {
+      insideNestedOnly = true;
+      continue;
+    }
+    const rootInfo = await lstat(root).catch(() => null);
+    if (!rootInfo?.isDirectory() || rootInfo.isSymbolicLink()) {
+      throw transferError("Authorized workspace root is unavailable or symbolic.", "unauthorized-path");
+    }
     const rootRealPath = await realpath(root).catch(() => null);
     if (!rootRealPath) continue;
-    if (mode === "read") {
-      const candidateRealPath = await realpath(candidate).catch(() => null);
-      if (!candidateRealPath || !isInside(rootRealPath, candidateRealPath)) {
-        throw transferError("File path escapes the authorized workspace.", "unauthorized-path");
-      }
-    } else {
-      const parentRealPath = await realpath(path.dirname(candidate)).catch(() => null);
-      if (!parentRealPath || !isInside(rootRealPath, parentRealPath)) {
-        throw transferError("Destination path escapes the authorized workspace.", "unauthorized-path");
-      }
-      const existing = await lstat(candidate).catch(() => null);
-      if (existing?.isSymbolicLink()) {
-        throw transferError("Destination path must not be a symbolic link.", "symlink-path");
-      }
+    const existing = await lstat(candidate).catch(() => null);
+    if (existing?.isSymbolicLink()) {
+      throw transferError("Destination path must not be a symbolic link.", "symlink-path");
     }
-    return candidate;
+    return { path: candidate, rootRealPath };
+  }
+  if (insideNestedOnly) {
+    throw transferError(
+      "Download destinations must sit directly inside an authorized workspace root.",
+      "nested-destination",
+    );
   }
   throw transferError("Transfer path is outside every authorized workspace root.", "unauthorized-path");
+}
+
+// Path-based validation is inherently time-of-check/time-of-use racy: a parent
+// directory can be swapped for a symbolic link after validation. This binds the
+// transfer to the opened file handle instead: the handle's device and inode
+// must match the freshly resolved path, and that resolved path must still sit
+// inside the authorized root. All bytes then flow through the verified handle,
+// which no later path swap can redirect.
+async function verifyOpenFileWithinRoot(file, candidatePath, rootRealPath, label) {
+  const resolvedPath = await realpath(candidatePath).catch(() => null);
+  if (!resolvedPath || !isInside(rootRealPath, resolvedPath)) {
+    throw transferError(`${label} escapes the authorized workspace.`, "unauthorized-path");
+  }
+  const handleInfo = await file.stat();
+  const pathInfo = await lstat(resolvedPath).catch(() => null);
+  if (!pathInfo || pathInfo.dev !== handleInfo.dev || pathInfo.ino !== handleInfo.ino) {
+    throw transferError(`${label} changed while the transfer was starting.`, "path-changed");
+  }
+  return handleInfo;
 }
 
 async function responseText(response, maximumBytes = MAX_RESPONSE_TEXT_BYTES) {
@@ -172,24 +199,30 @@ async function writeAll(file, value) {
   }
 }
 
-async function readFileBytes(file, size, signal) {
-  const result = Buffer.allocUnsafe(size);
-  let offset = 0;
-  while (offset < size) {
-    signal?.throwIfAborted();
-    const length = Math.min(size - offset, 1024 * 1024);
-    const { bytesRead } = await file.read(result, offset, length);
-    if (bytesRead === 0) throw transferError("File size changed while it was being read.", "size-mismatch");
-    offset += bytesRead;
-  }
-  signal?.throwIfAborted();
-  return result;
-}
-
-export async function uploadMultipartFromPath(input, options) {
-  const url = remoteUrl(input?.url);
+// Uploads deliberately take bytes, not a path. The renderer only ever holds
+// bytes it was already allowed to read (a user-selected File), so the main
+// process gains no filesystem read authority on the renderer's behalf and no
+// configuration value can widen what an upload may exfiltrate.
+export async function uploadMultipartFromBytes(input, options) {
+  const url = remoteUrl(input?.url, options?.allowedUrlPrefixes);
   const expectedBytes = boundedByteCount(input?.size, "File size");
-  const filePath = await resolveAuthorizedPath(input?.filePath, options?.authorizedRoots, "read");
+  const bytes = input?.bytes;
+  let data = null;
+  if (bytes instanceof ArrayBuffer) {
+    data = new Uint8Array(bytes);
+  } else if (ArrayBuffer.isView(bytes)) {
+    // Copy into an owned buffer so the payload is an immutable snapshot.
+    data = new Uint8Array(bytes.byteLength);
+    data.set(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+  }
+  if (!data) throw transferError("Upload bytes are required.", "invalid-file");
+  boundedByteCount(data.byteLength, "File size");
+  if (data.byteLength !== expectedBytes) {
+    throw transferError(
+      `File size changed: expected ${expectedBytes} bytes but received ${data.byteLength}.`,
+      "size-mismatch",
+    );
+  }
   const filename = boundedString(input?.filename, "Filename", { required: true });
   if (filename !== path.basename(filename) || /[\\/]/.test(filename)) {
     throw transferError("Filename must not contain a path.", "invalid-metadata");
@@ -200,49 +233,55 @@ export async function uploadMultipartFromPath(input, options) {
   const headers = boundedRecord(input?.headers, "Headers", MAX_HEADERS);
   const method = boundedString(input?.method ?? "POST", "Method", { required: true, maxLength: 16 });
   const signal = timeoutSignal(input?.timeoutMs, options?.signal);
-  const file = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-  try {
-    const info = await file.stat();
-    if (!info.isFile()) throw transferError("Upload path is not a regular file.", "invalid-file");
-    boundedByteCount(info.size, "File size");
-    if (info.size !== expectedBytes) {
-      throw transferError(`File size changed: expected ${expectedBytes} bytes but found ${info.size}.`, "size-mismatch");
-    }
-    const data = await readFileBytes(file, expectedBytes, signal);
-    const form = new FormData();
-    form.append(fieldName, new Blob([data], contentType ? { type: contentType } : undefined), filename);
-    for (const [name, value] of Object.entries(fields)) form.append(name, value);
-    const response = await options.fetcher(url, {
-      method,
-      headers,
-      body: form,
-      credentials: "omit",
-      cache: "no-store",
-      signal,
-    });
-    return { ...responseMetadata(response), body: await responseText(response) };
-  } finally {
-    await file.close();
-  }
+  const form = new FormData();
+  form.append(fieldName, new Blob([data], contentType ? { type: contentType } : undefined), filename);
+  for (const [name, value] of Object.entries(fields)) form.append(name, value);
+  const response = await options.fetcher(url, {
+    method,
+    headers,
+    body: form,
+    credentials: "omit",
+    cache: "no-store",
+    // The endpoint allowlist covers only the initial URL, so a redirect
+    // must never be followed to an unvalidated destination.
+    redirect: "error",
+    signal,
+  });
+  return { ...responseMetadata(response), body: await responseText(response) };
 }
 
+// Downloads stream into a private staging file inside an app-owned directory
+// first, and only a fully successful download is placed into the workspace.
+// The staging directory sits outside every authorized workspace root, so a
+// process with workspace write access cannot swap its parents; its cleanup is
+// the only path-based removal this module performs. Inside the workspace the
+// destination is created exclusively, verified by device and inode, written
+// through the verified handle, and never unlinked by path: failure cleanup
+// truncates through the handle instead.
 export async function downloadBinaryToPath(input, options) {
-  const url = remoteUrl(input?.url);
-  const destinationPath = await resolveAuthorizedPath(input?.destinationPath, options?.authorizedRoots, "write");
+  const url = remoteUrl(input?.url, options?.allowedUrlPrefixes);
+  const destination = await resolveAuthorizedPath(input?.destinationPath, options?.authorizedRoots);
+  const destinationPath = destination.path;
   const maxBytes = boundedByteCount(input?.maxBytes, "Maximum download size", { allowUndefined: true });
   const headers = boundedRecord(input?.headers, "Headers", MAX_HEADERS);
   const method = boundedString(input?.method ?? "GET", "Method", { required: true, maxLength: 16 });
   const signal = timeoutSignal(input?.timeoutMs, options?.signal);
-  const parent = path.dirname(destinationPath);
-  await mkdir(parent, { recursive: true });
-  const temporaryPath = path.join(parent, `.${path.basename(destinationPath)}.${randomUUID()}.part`);
-  let temporaryFile;
+  const stagingDir = boundedString(options?.stagingDir, "Staging directory", { required: true, maxLength: 32_768 });
+  if (!path.isAbsolute(stagingDir)) {
+    throw transferError("Staging directory must be absolute.", "invalid-staging");
+  }
+  let stagingPath;
+  let stagingFile;
+  let destinationFile;
   try {
     const response = await options.fetcher(url, {
       method,
       headers,
       credentials: "omit",
       cache: "no-store",
+      // The endpoint allowlist covers only the initial URL, so a redirect
+      // must never be followed to an unvalidated destination.
+      redirect: "error",
       signal,
     });
     if (!response.ok) {
@@ -252,7 +291,9 @@ export async function downloadBinaryToPath(input, options) {
     if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
       throw transferError(`Download exceeds the ${maxBytes}-byte limit.`, "file-too-large");
     }
-    temporaryFile = await open(temporaryPath, "wx");
+    await mkdir(stagingDir, { recursive: true });
+    stagingPath = path.join(stagingDir, `download-${randomUUID()}.part`);
+    stagingFile = await open(stagingPath, "wx+");
     const reader = response.body?.getReader();
     let bytes = 0;
     if (reader) {
@@ -265,19 +306,51 @@ export async function downloadBinaryToPath(input, options) {
           await reader.cancel();
           throw transferError(`Download exceeds the ${maxBytes}-byte limit.`, "file-too-large");
         }
-        await writeAll(temporaryFile, value);
+        await writeAll(stagingFile, value);
       }
     }
     if (bytes === 0) throw transferError("Download response was empty.", "zero-byte-file");
-    await temporaryFile.sync();
-    await temporaryFile.close();
-    temporaryFile = undefined;
-    await rename(temporaryPath, destinationPath);
+    // Only a complete download reaches the workspace. Revalidate the
+    // destination, create it exclusively ("wx" never follows a final
+    // symlink), and prove by device and inode that the created file resides
+    // inside the authorized root before a single byte is written to it.
+    await resolveAuthorizedPath(input?.destinationPath, options?.authorizedRoots);
+    try {
+      destinationFile = await open(destinationPath, "wx");
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        throw transferError("Download destination already exists.", "destination-exists");
+      }
+      throw error;
+    }
+    await verifyOpenFileWithinRoot(destinationFile, destinationPath, destination.rootRealPath, "Download destination");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    while (position < bytes) {
+      signal?.throwIfAborted();
+      const { bytesRead } = await stagingFile.read(buffer, 0, Math.min(buffer.length, bytes - position), position);
+      if (bytesRead === 0) {
+        throw transferError("Downloaded data changed while it was being saved.", "size-mismatch");
+      }
+      await writeAll(destinationFile, buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    await destinationFile.sync();
+    await destinationFile.close();
+    destinationFile = undefined;
     return { ...responseMetadata(response), path: destinationPath, bytes };
   } catch (error) {
-    await temporaryFile?.close().catch(() => undefined);
+    // Cleanup goes through the verified handle, never through the path, so a
+    // swapped parent cannot turn cleanup into an out-of-workspace deletion.
+    if (destinationFile) {
+      await destinationFile.truncate(0).catch(() => undefined);
+      await destinationFile.close().catch(() => undefined);
+    }
     throw error;
   } finally {
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    await stagingFile?.close().catch(() => undefined);
+    if (stagingPath) {
+      await rm(stagingPath, { force: true }).catch(() => undefined);
+    }
   }
 }

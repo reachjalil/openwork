@@ -48,6 +48,7 @@ import {
   connectorInstanceListQuerySchema,
   connectorInstanceListResponseSchema,
   connectorInstanceMutationResponseSchema,
+  connectorInstanceSyncNowResponseSchema,
   connectorInstanceParamsSchema,
   connectorInstanceUpdateSchema,
   connectorMappingCreateSchema,
@@ -92,6 +93,8 @@ import {
   marketplacePluginParamsSchema,
   marketplacePluginWriteSchema,
   marketplaceUpdateSchema,
+  meLibraryListResponseSchema,
+  mePluginAccessListResponseSchema,
   pluginAccessGrantParamsSchema,
   pluginCreateSchema,
   pluginDetailResponseSchema,
@@ -106,11 +109,14 @@ import {
   pluginParamsSchema,
   pluginUpdateSchema,
   resourceAccessGrantWriteSchema,
+  teamParamsSchema,
+  teamPluginAccessListResponseSchema,
 } from "./schemas.js"
-import { requirePluginArchCapability, type PluginArchActorContext, PluginArchAuthorizationError } from "./access.js"
+import { isPluginArchOrgAdmin, requirePluginArchCapability, type PluginArchActorContext, PluginArchAuthorizationError } from "./access.js"
 import { pluginArchRoutePaths } from "./contracts.js"
 import { ensureOrganizationAdmin, orgAccessFailureStatus } from "../shared.js"
-import { isAgentOAuthClientConnection } from "../mcp-connections.js"
+import { isAgentOAuthClientConnection, listMemberUsableConnectionFacts } from "../mcp-connections.js"
+import { listWorkflowLibraryItems } from "../../../workflow-library.js"
 import {
   PluginArchRouteFailure,
   addPluginMembership,
@@ -151,9 +157,13 @@ import {
   listGithubRepositories,
   listMarketplaceMemberships,
   listMarketplaces,
+  listMeLibraryConnectionItems,
+  listMeLibraryPluginItems,
+  listMeEffectivePluginAccess,
   listPluginMemberships,
   listPlugins,
   listResourceAccess,
+  listTeamEffectivePluginAccess,
   attachPluginToMarketplace,
   completeGithubConnectorInstall,
   applyGithubConnectorDiscovery,
@@ -169,6 +179,7 @@ import {
   removePluginFromMarketplace,
   removePluginMembership,
   retryConnectorSyncEvent,
+  syncConnectorInstanceNow,
   setConfigObjectLifecycle,
   setConnectorInstanceLifecycle,
   setMarketplaceLifecycle,
@@ -378,7 +389,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
-        await requirePluginArchCapability(context, "config_object.create")
+        await requirePluginArchCapability(context, "config_object.create", false)
         const body = validJson<any>(c)
         const item = await createConfigObject({
           context,
@@ -711,10 +722,13 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
-        await requirePluginArchCapability(context, "plugin.create")
         const body = validJson<PluginCreateBody>(c)
+        await requirePluginArchCapability(context, "plugin.create", body.orgWide === true || Boolean(body.marketplaceId))
+        if (body.orgWide === true && !isPluginArchOrgAdmin(context)) {
+          throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can create org-wide plugins.")
+        }
         if ((body.components?.length ?? 0) > 0) {
-          await requirePluginArchCapability(context, "config_object.create")
+          await requirePluginArchCapability(context, "config_object.create", false)
         }
         return c.json({
           ok: true,
@@ -725,6 +739,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
             marketplaceId: body.marketplaceId,
             name: body.name,
             orgWide: body.orgWide,
+            sourceRepositoryUrl: body.sourceRepositoryUrl,
           }),
         }, 201)
       } catch (error) {
@@ -832,7 +847,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Add plugin config object",
-      description: "Adds a config object to a plugin.",
+      description: "Adds a config object to a plugin. Workflows require manager access because this can expand their audience through Plugin and Marketplace grants.",
       responses: {
         201: jsonResponse("Plugin membership created successfully.", pluginMembershipMutationResponseSchema),
         400: jsonResponse("The plugin membership request was invalid.", invalidRequestSchema),
@@ -856,7 +871,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Remove plugin config object",
-      description: "Removes one config object from a plugin.",
+      description: "Removes one config object from a plugin. Workflows require manager access because this revokes inherited Plugin or Marketplace access.",
       responses: {
         204: emptyResponse("Plugin membership removed successfully."),
         400: jsonResponse("The plugin membership path parameters were invalid.", invalidRequestSchema),
@@ -891,7 +906,13 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const params = validParam<any>(c)
-        return c.json(await listPluginMemberships({ context: actorContext(c), includeConfigObjects: true, onlyActive: true, pluginId: params.pluginId }))
+        return c.json(await listPluginMemberships({
+          context: actorContext(c),
+          includeConfigObjects: true,
+          legacyWorkflowObjectType: true,
+          onlyActive: true,
+          pluginId: params.pluginId,
+        }))
       } catch (error) {
         return routeErrorResponse(c, error)
       }
@@ -993,6 +1014,80 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
       try {
         const params = validParam<any>(c)
         return c.json(await listResourceAccess({ context: actorContext(c), resourceId: params.pluginId, resourceKind: "plugin" }))
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "get", pluginArchRoutePaths.mePluginAccess,
+    describeRoute({
+      tags: ["Plugins"],
+      summary: "List my effective plugin access",
+      description: "Lists active plugins in the caller's organization library and every access edge that applies to the caller.",
+      responses: {
+        200: jsonResponse("Effective member plugin access returned successfully.", mePluginAccessListResponseSchema),
+        401: jsonResponse("The caller must be signed in to view plugin access.", unauthorizedSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        return c.json(await listMeEffectivePluginAccess({ context: actorContext(c) }))
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "get", pluginArchRoutePaths.meLibrary,
+    describeRoute({
+      tags: ["Plugins"],
+      summary: "List my library",
+      description: "Lists the Workflows, Remote MCP Apps, plugins, and connections the caller can use, with every applicable access edge. Workflows and Remote MCP Apps remain config objects contained by their parent OpenWork Connect Plugin.",
+      responses: {
+        200: jsonResponse("Effective member library returned successfully.", meLibraryListResponseSchema),
+        401: jsonResponse("The caller must be signed in to view their library.", unauthorizedSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const context = actorContext(c)
+        const [pluginItems, connections, workflowItems] = await Promise.all([
+          listMeLibraryPluginItems({ context }),
+          listMemberUsableConnectionFacts({ context }),
+          listWorkflowLibraryItems({ context }),
+        ])
+        const connectionItems = await listMeLibraryConnectionItems({ connections, context })
+        const items = [...pluginItems, ...connectionItems, ...workflowItems]
+        items.sort((left, right) => {
+          const byName = left.name.localeCompare(right.name)
+          return byName !== 0 ? byName : left.id.localeCompare(right.id)
+        })
+        return c.json({ items })
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "get", pluginArchRoutePaths.teamPluginAccess,
+    paramValidator(teamParamsSchema),
+    describeRoute({
+      tags: ["Plugins"],
+      summary: "List effective team plugin access",
+      description: "Lists plugins available to a team through direct grants, marketplace grants, and organization-wide grants.",
+      responses: {
+        200: jsonResponse("Effective team plugin access returned successfully.", teamPluginAccessListResponseSchema),
+        400: jsonResponse("The team access path parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to view team plugin access.", unauthorizedSchema),
+        403: jsonResponse("The caller lacks permission to view this team's plugin access.", forbiddenSchema),
+        404: jsonResponse("The team could not be found.", notFoundSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const params = validParam<z.infer<typeof teamParamsSchema>>(c)
+        return c.json(await listTeamEffectivePluginAccess({
+          context: actorContext(c),
+          teamId: normalizeDenTypeId("team", params.teamId),
+        }))
       } catch (error) {
         return routeErrorResponse(c, error)
       }
@@ -1599,6 +1694,35 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
         const params = validParam<any>(c)
         const body = validJson<any>(c)
         return c.json({ ok: true, item: await setConnectorInstanceAutoImport({ autoImportNewPlugins: Boolean(body.autoImportNewPlugins), connectorInstanceId: params.connectorInstanceId, context }) })
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "post", pluginArchRoutePaths.connectorInstanceSyncNow,
+    paramValidator(connectorInstanceParamsSchema),
+    describeRoute({
+      tags: ["Connectors"],
+      summary: "Sync connector instance now",
+      description: "Queues sync work for each connector target without sync work already queued or running.",
+      responses: {
+        200: jsonResponse("Connector instance sync queued successfully.", connectorInstanceSyncNowResponseSchema),
+        400: jsonResponse("The connector instance path parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to sync connector instances.", unauthorizedSchema),
+        403: jsonResponse("The caller lacks permission to edit this connector instance.", forbiddenSchema),
+        404: jsonResponse("The connector instance could not be found.", notFoundSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const item = await syncConnectorInstanceNow({
+          connectorInstanceId: normalizeDenTypeId(
+            "connectorInstance",
+            validParam<z.infer<typeof connectorInstanceParamsSchema>>(c).connectorInstanceId,
+          ),
+          context: actorContext(c),
+        })
+        return c.json({ ok: true, item }, 200)
       } catch (error) {
         return routeErrorResponse(c, error)
       }

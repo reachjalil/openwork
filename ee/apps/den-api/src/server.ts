@@ -6,17 +6,23 @@ import { shutdownObservability } from "./observability/runtime.js"
 import { startScimMaintenanceLoop } from "./scim-maintenance.js"
 import { startCloudIdleStopLoop } from "./workers/cloud-lifecycle.js"
 import { startWorkerProvisioningReconcileLoop } from "./workers/reconciler.js"
-import { startTelegramUpdateDispatcher } from "./capability-sources/telegram-dispatcher.js"
+import { startGithubSyncWorker } from "./workers/github-sync.js"
 import { externalMcpClientRuntimeName } from "./capability-sources/external-mcp-client-runtime.js"
+import { startAutomationSchedulerLoop } from "./automations/scheduler-loop.js"
 
 const stopScimMaintenanceLoop = startScimMaintenanceLoop()
 const stopCloudIdleStopLoop = startCloudIdleStopLoop()
 const stopWorkerProvisioningReconcileLoop = startWorkerProvisioningReconcileLoop()
-const stopTelegramUpdateDispatcher = startTelegramUpdateDispatcher()
+const stopGithubSyncWorker = startGithubSyncWorker()
+const automationScheduler = startAutomationSchedulerLoop({ enabled: env.automations.runtimeEnabled })
 
 appLogger.info("external mcp implementation selected", { component: "server", runtime: externalMcpClientRuntimeName })
 
-const server = serve({ fetch: app.fetch, port: env.port }, (info) => {
+// Optional bind host: eval/testkit servers run in dev mode (unauthenticated
+// dev outbox) and must not be reachable from the LAN; production/default
+// behavior (all interfaces) is unchanged when DEN_BIND_HOST is unset.
+const bindHost = process.env.DEN_BIND_HOST?.trim()
+const server = serve({ fetch: app.fetch, port: env.port, ...(bindHost ? { hostname: bindHost } : {}) }, (info) => {
   appLogger.info("server listening", { component: "server", port: info.port })
 })
 
@@ -70,7 +76,8 @@ async function stopBackgroundLoops() {
     stopScimMaintenanceLoop(),
     stopCloudIdleStopLoop(),
     stopWorkerProvisioningReconcileLoop(),
-    stopTelegramUpdateDispatcher(),
+    stopGithubSyncWorker(),
+    automationScheduler.stop(),
   ])
 
   for (const result of results) {
