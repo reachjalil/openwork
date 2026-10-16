@@ -6,11 +6,16 @@ import { t } from "../../../i18n";
  * - app: a runtime that runs on this device (Ollama, Computer Use, Browser, Voice)
  * - connection: an account, shared by an organization or signed in by the member
  * - mcp: an MCP server configured in this workspace
- * - skill / plugin: installed workflows and organization bundles
+ * - skill / command / agent: composer capabilities managed in Library
+ * - plugin: organization bundles
  */
-export type ExtensionTaxonomy = "app" | "connection" | "mcp" | "skill" | "plugin";
+export type ExtensionTaxonomy = "app" | "connection" | "mcp" | "skill" | "command" | "agent" | "plugin";
 
 export type ExtensionInventoryFilter = "all" | ExtensionTaxonomy;
+
+export type ExtensionTransport = "mcp" | "native" | null;
+
+export type ExtensionInventoryState = "all" | "needs_signin" | "needs_admin_setup" | "ready";
 
 export const extensionInventoryFilters: ExtensionInventoryFilter[] = [
   "all",
@@ -18,6 +23,8 @@ export const extensionInventoryFilters: ExtensionInventoryFilter[] = [
   "connection",
   "mcp",
   "skill",
+  "command",
+  "agent",
   "plugin",
 ];
 
@@ -27,8 +34,12 @@ export function taxonomyForDirectoryEntry(entry: McpDirectoryInfo): ExtensionTax
   return "mcp";
 }
 
-export function matchesExtensionFilter(filter: ExtensionInventoryFilter, taxonomy: ExtensionTaxonomy) {
-  return filter === "all" || filter === taxonomy;
+export function matchesExtensionFilter(
+  filter: ExtensionInventoryFilter,
+  taxonomy: ExtensionTaxonomy,
+  transport: ExtensionTransport = null,
+) {
+  return filter === "all" || filter === taxonomy || (filter === "mcp" && transport === "mcp");
 }
 
 export function extensionFilterLabel(filter: ExtensionInventoryFilter) {
@@ -43,6 +54,10 @@ export function extensionFilterLabel(filter: ExtensionInventoryFilter) {
       return t("extensions.filter_mcps");
     case "skill":
       return t("extensions.filter_skills");
+    case "command":
+      return t("extensions.filter_commands");
+    case "agent":
+      return t("extensions.filter_agents");
     case "plugin":
       return t("extensions.filter_plugins");
   }
@@ -58,6 +73,10 @@ export function extensionTaxonomyLabel(taxonomy: ExtensionTaxonomy) {
       return t("extensions.badge_mcp");
     case "skill":
       return t("extensions.badge_skill");
+    case "command":
+      return t("extensions.badge_command");
+    case "agent":
+      return t("extensions.badge_agent");
     case "plugin":
       return t("extensions.badge_plugin");
   }

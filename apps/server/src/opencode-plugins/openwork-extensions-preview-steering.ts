@@ -128,7 +128,8 @@ const connectStateResponseSchema = z.object({
   }).passthrough(),
 }).passthrough();
 
-const connectSkillsResponseSchema = z.object({
+// Both catalogs answer with the same envelope: a rendered prompt section.
+const connectCatalogResponseSchema = z.object({
   ok: z.literal(true),
   schemaVersion: z.number(),
   instruction: z.string(),
@@ -138,13 +139,19 @@ export const OPENWORK_EXTENSION_DISCOVERY_INSTRUCTION =
   "If the user asks for something you cannot do with obvious built-in tools, check OpenWork extensions before saying the capability is unavailable. Use openwork_query with id extension.actions to inspect available extension actions, then openwork_execute with id extension.call for the matching action.";
 
 export const OPENWORK_CLOUD_SKILL_AUTHORING_INSTRUCTION =
-  "Skill creation: Cloud. When the user asks to create a skill, retrieve and follow the listed create-skill remote skill by calling openwork-cloud_execute_capability with its exact <capability>. Create the skill in OpenWork Cloud as a private plugin, not in the workspace. For later steps, use add-to-marketplace or add-user-to-marketplace only when the user asks. Use a workspace-local skill only when the user explicitly requests one. Do not create both copies.";
+  "Skill creation: Cloud. When the user asks to create a skill, retrieve and follow the listed create-skill remote skill by calling openwork-cloud_execute_capability with its exact <capability>. Create the skill in OpenWork Cloud as a private plugin, not in the workspace. For later steps, use share-plugin when the user wants a specific person or team to use a skill, and use add-to-marketplace or add-user-to-marketplace only when the user asks. Use a workspace-local skill only when the user explicitly requests one. Do not create both copies.";
 
 export const OPENWORK_LOCAL_SKILL_AUTHORING_INSTRUCTION =
   "Skill creation: Local. Create or update a workspace-local skill only when the user requests one. Keep one skill in .opencode/skills/<skill-name>/SKILL.md, validate it, and re-read it after writing. Do not create a Cloud copy.";
 
+// Availability signal + routing only. The detailed Connect contract (MCP
+// Apps, connection_status handling, schema guidance, retry semantics) ships
+// with the connection itself as the openwork-cloud server's MCP initialize
+// instructions — which are guaranteed present exactly when this "ready"
+// steering is selected. Restating it here costs ~1k characters on every
+// request and drifts.
 export const OPENWORK_CLOUD_CONNECTION_INSTRUCTION =
-  "The OpenWork Cloud connection is verified ready for this exact workspace/model. For org-connected services, use openwork-cloud_search_capabilities with 2-4 keyword variants, then openwork-cloud_execute_capability with an exact returned name — and only mention services that search (or available_skills) actually returns. When a remote skill is listed under available_skills, call openwork-cloud_execute_capability with that skill's <capability> directly; do not treat the local OpenCode skill list as the full inventory. Local OpenWork extensions remain available through openwork_query/openwork_execute with extension.actions and extension.call. Settings > Extensions is the member inventory surface for org and local apps. A successful search proves OpenWork Cloud itself is authorized, so a downstream connector failure does not mean OpenWork Cloud needs to be reconnected. If a result has kind connection_status, name connectionStatus.connectionName and relay connectionStatus.action exactly: use Your Connections for the member, the organization Connections dashboard for an org admin, or the provider admin console for a provider-side failure. After the requested human fixes that connector, search again in the same task because results are live, not cached, so unchanged retries return the same error.";
+  "The OpenWork Cloud connection is verified ready for this exact workspace/model. Route org-connected services through it: use openwork-cloud_search_capabilities with 2-4 keyword variants, then openwork-cloud_execute_capability with an exact returned name — and only mention services that search (or available_skills) actually returns. The openwork-cloud server instructions are authoritative for MCP Apps, connection_status results, schema guidance, and retry rules; follow them instead of improvising. A successful search proves OpenWork Cloud itself is authorized, so a downstream connector failure does not mean OpenWork Cloud needs to be reconnected. Local OpenWork extensions remain available through openwork_query/openwork_execute with extension.actions and extension.call.";
 
 export const OPENWORK_CONNECT_SIGN_IN_INSTRUCTION =
   `${OPENWORK_EXTENSION_DISCOVERY_INSTRUCTION} OpenWork Cloud is not signed in or no desired agent access configuration exists for this workspace. Direct the user to sign in to OpenWork and connect the service in Settings → Connect.`;
@@ -305,7 +312,21 @@ export async function resolveOpenWorkConnectSkillInstruction(_input?: unknown, f
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!response.ok) return "";
-    return connectSkillsResponseSchema.parse(await parseResponse(response)).instruction;
+    return connectCatalogResponseSchema.parse(await parseResponse(response)).instruction;
+  } catch {
+    return "";
+  }
+}
+
+export async function resolveOpenWorkAutomationInstruction(_input?: unknown, fetcher: OpenWorkFetch = fetch): Promise<string> {
+  try {
+    const { url, token } = requireOpenWorkServer();
+    // Automations are account-scoped like Connect skills, not per-workspace.
+    const response = await fetcher(`${url}/experimental/connect/automations`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) return "";
+    return connectCatalogResponseSchema.parse(await parseResponse(response)).instruction;
   } catch {
     return "";
   }

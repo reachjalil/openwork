@@ -56,6 +56,7 @@ export type ExternalMcpConnection = {
   reconnectActionOwner?: "member" | "organization_admin" | null;
   missingFeatures?: string[];
   externalAccountId?: string | null;
+  nativeProviderKey?: string | null;
   grantedScopes?: string[];
   tenantId?: string | null;
   requiredBy: ExternalMcpRequiredBy[];
@@ -143,6 +144,18 @@ export type ExternalMcpTool = {
   };
 };
 
+export type ExternalMcpToolPolicyView = {
+  allDisabled: boolean;
+  disabledTools: string[];
+  updatedBy: string | null;
+  updatedAt: string | null;
+};
+
+export type ExternalMcpToolCatalog = {
+  tools: ExternalMcpTool[];
+  policy: ExternalMcpToolPolicyView;
+};
+
 export type ExternalMcpToolRun = {
   referenceId: string;
   durationMs: number;
@@ -201,6 +214,18 @@ export class ExternalMcpToolRunError extends Error {
   }
 }
 
+export class ExternalMcpToolPolicyBlockedError extends ExternalMcpToolRunError {
+  readonly disabledBy: string | null;
+  readonly disabledAt: string | null;
+
+  constructor(message: string, disabledBy: string | null, disabledAt: string | null) {
+    super(message, null, null);
+    this.name = "ExternalMcpToolPolicyBlockedError";
+    this.disabledBy = disabledBy;
+    this.disabledAt = disabledAt;
+  }
+}
+
 export type ExternalMcpPreset = {
   presetId: string;
   displayName: string;
@@ -217,12 +242,12 @@ export type CreatedMcpConnection = ExternalMcpConnection & {
   };
 };
 
-export function isNativeProviderConnectionId(id: string): boolean {
-  return id === "google-workspace" || id === "microsoft-365";
+export function isNativeProviderConnectionId(id: string, nativeProviderKey?: string | null): boolean {
+  return nativeProviderKey != null || id === "google-workspace" || id === "microsoft-365";
 }
 
-export function canDisconnectMyConnectionAccount(connection: Pick<ExternalMcpConnection, "id" | "credentialMode" | "connectedForMe">): boolean {
-  return connection.connectedForMe && (isNativeProviderConnectionId(connection.id) || connection.credentialMode === "per_member");
+export function canDisconnectMyConnectionAccount(connection: Pick<ExternalMcpConnection, "id" | "nativeProviderKey" | "credentialMode" | "connectedForMe">): boolean {
+  return connection.connectedForMe && (isNativeProviderConnectionId(connection.id, connection.nativeProviderKey) || connection.credentialMode === "per_member");
 }
 
 export const mcpConnectionQueryKeys = {
@@ -234,15 +259,45 @@ export const mcpConnectionQueryKeys = {
     [...mcpConnectionQueryKeys.all, "tools", orgId ?? "none", connectionId ?? "none"] as const,
   nativeProviderClient: (orgId?: string | null, providerId?: string | null) =>
     [...mcpConnectionQueryKeys.all, "native-provider-client", orgId ?? "none", providerId ?? "none"],
-  telegram: (orgId?: string | null) => [...mcpConnectionQueryKeys.all, "telegram", orgId ?? "none"] as const,
 };
+
+function isExternalMcpTool(value: unknown): value is ExternalMcpTool {
+  if (!isRecord(value) || typeof value.name !== "string" || !isRecord(value.inputSchema)) return false;
+  if (value.title !== undefined && typeof value.title !== "string") return false;
+  if (value.description !== undefined && typeof value.description !== "string") return false;
+  if (value.outputSchema !== undefined && !isRecord(value.outputSchema)) return false;
+  const annotations = value.annotations;
+  if (annotations === undefined) return true;
+  if (!isRecord(annotations)) return false;
+  return ["title", "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"].every((key) => (
+    annotations[key] === undefined
+    || typeof annotations[key] === (key === "title" ? "string" : "boolean")
+  ));
+}
+
+function parseExternalMcpToolPolicy(value: unknown): ExternalMcpToolPolicyView | null {
+  if (
+    !isRecord(value)
+    || typeof value.allDisabled !== "boolean"
+    || !Array.isArray(value.disabledTools)
+    || !value.disabledTools.every((toolName) => typeof toolName === "string")
+    || (value.updatedBy !== null && typeof value.updatedBy !== "string")
+    || (value.updatedAt !== null && typeof value.updatedAt !== "string")
+  ) return null;
+  return {
+    allDisabled: value.allDisabled,
+    disabledTools: value.disabledTools,
+    updatedBy: value.updatedBy,
+    updatedAt: value.updatedAt,
+  };
+}
 
 export function useMcpConnectionTools(connectionId: string, enabled: boolean) {
   const { orgId } = useOrgDashboard();
   return useQuery({
     enabled: enabled && Boolean(orgId),
     queryKey: mcpConnectionQueryKeys.tools(orgId, connectionId),
-    queryFn: async (): Promise<ExternalMcpTool[]> => {
+    queryFn: async (): Promise<ExternalMcpToolCatalog> => {
       const { response, payload } = await requestJson(
         `/v1/mcp-connections/${encodeURIComponent(connectionId)}/tools`,
         { headers: getOrgScopeHeaders(requireOrgId(orgId)) },
@@ -251,9 +306,40 @@ export function useMcpConnectionTools(connectionId: string, enabled: boolean) {
       if (!response.ok) {
         throw getRequestError(payload, response, `Failed to inspect MCP tools (${response.status}).`);
       }
-      const record = payload as { tools?: ExternalMcpTool[] };
-      return record.tools ?? [];
+      if (!isRecord(payload) || !Array.isArray(payload.tools)) {
+        throw new Error("MCP tool catalog response was incomplete.");
+      }
+      const policy = parseExternalMcpToolPolicy(payload.policy);
+      if (!policy || !payload.tools.every(isExternalMcpTool)) {
+        throw new Error("MCP tool catalog response was incomplete.");
+      }
+      return { tools: payload.tools, policy };
     },
+  });
+}
+
+export function useUpdateMcpConnectionToolPolicy(connectionId: string) {
+  const queryClient = useQueryClient();
+  const { orgId } = useOrgDashboard();
+  return useMutation({
+    mutationFn: async (input: Pick<ExternalMcpToolPolicyView, "allDisabled" | "disabledTools">): Promise<ExternalMcpToolPolicyView> => {
+      const { response, payload } = await requestJson(
+        `/v1/mcp-connections/${encodeURIComponent(connectionId)}/tool-policy`,
+        {
+          method: "PUT",
+          headers: getOrgScopeHeaders(requireOrgId(orgId)),
+          body: JSON.stringify(input),
+        },
+        30000,
+      );
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to update MCP tool policy (${response.status}).`);
+      }
+      const policy = isRecord(payload) ? parseExternalMcpToolPolicy(payload.policy) : null;
+      if (!policy) throw new Error("MCP tool policy response was incomplete.");
+      return policy;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.tools(orgId, connectionId) }),
   });
 }
 
@@ -276,6 +362,13 @@ export function useRunMcpConnectionTool(connectionId: string) {
         RUN_TOOL_REQUEST_TIMEOUT_MS,
       );
       if (!response.ok) {
+        if (response.status === 403 && isRecord(payload) && payload.error === "policy_blocked") {
+          throw new ExternalMcpToolPolicyBlockedError(
+            typeof payload.message === "string" ? payload.message : "This tool is disabled by organization policy.",
+            typeof payload.disabledBy === "string" ? payload.disabledBy : null,
+            typeof payload.disabledAt === "string" ? payload.disabledAt : null,
+          );
+        }
         const requestError = getRequestError(payload, response, `Failed to run MCP tool (${response.status}).`);
         throw new ExternalMcpToolRunError(
           requestError.message,
@@ -532,6 +625,16 @@ export type CreateMcpConnectionInput = {
   access: McpConnectionAccessInput;
 };
 
+export type CreateNativeProviderConnectionInput = {
+  nativeProviderKey: string;
+  name: string;
+  oauthClient: {
+    clientId: string;
+    clientSecret?: string;
+    features: string[];
+  };
+};
+
 export type UpdateMcpConnectionInput = {
   connectionId: string;
   expectedUpdatedAt: string;
@@ -632,6 +735,37 @@ export function useCreateMcpConnection() {
         created = payload as CreatedMcpConnection;
       });
       if (!created) throw new Error("Create MCP connection response was incomplete.");
+      return created;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.all });
+    },
+  });
+}
+
+export function useCreateNativeProviderConnection() {
+  const queryClient = useQueryClient();
+  const { orgId, runReauthableAction } = useOrgDashboard();
+
+  return useMutation({
+    mutationFn: async (input: CreateNativeProviderConnectionInput): Promise<CreatedMcpConnection> => {
+      let created: CreatedMcpConnection | null = null;
+      await runReauthableAction("create-mcp-connection", async () => {
+        const { response, payload } = await requestJson(
+          "/v1/mcp-connections",
+          {
+            method: "POST",
+            headers: getOrgScopeHeaders(requireOrgId(orgId)),
+            body: JSON.stringify({ kind: "native_provider", ...input }),
+          },
+          20000,
+        );
+        if (!response.ok) {
+          throw getRequestError(payload, response, `Failed to add native provider connection (${response.status}).`);
+        }
+        created = payload as CreatedMcpConnection;
+      });
+      if (!created) throw new Error("Create native provider connection response was incomplete.");
       return created;
     },
     onSuccess: () => {
@@ -770,10 +904,10 @@ export function useDisconnectMyProviderAccount() {
   const { orgId } = useOrgDashboard();
 
   return useMutation({
-    mutationFn: async (providerId: string): Promise<string> => {
-      const path = isNativeProviderConnectionId(providerId)
-        ? `/v1/oauth-providers/${encodeURIComponent(providerId)}/disconnect`
-        : `/v1/mcp-connections/${encodeURIComponent(providerId)}/disconnect-my-account`;
+    mutationFn: async (connection: Pick<ExternalMcpConnection, "id" | "nativeProviderKey">): Promise<string> => {
+      const path = isNativeProviderConnectionId(connection.id, connection.nativeProviderKey)
+        ? `/v1/oauth-providers/${encodeURIComponent(connection.id)}/disconnect`
+        : `/v1/mcp-connections/${encodeURIComponent(connection.id)}/disconnect-my-account`;
       const { response, payload } = await requestJson(
         path,
         { method: "POST", headers: getOrgScopeHeaders(requireOrgId(orgId)) },
@@ -782,7 +916,7 @@ export function useDisconnectMyProviderAccount() {
       if (!response.ok) {
         throw getRequestError(payload, response, `Failed to disconnect account (${response.status}).`);
       }
-      return providerId;
+      return connection.id;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.all });
@@ -946,185 +1080,6 @@ export function useNativeProviderClient(providerId: string, enabled: boolean) {
       }
       return client;
     },
-  });
-}
-
-export type TelegramConnection = {
-  id: string;
-  status: "active" | "error";
-  connected: boolean;
-  bot: { id: string; username: string | null; displayName: string };
-  worker: { id: string; name: string; status: string };
-  webhook: { registered: boolean; lastReceivedAt: string | null; lastError: string | null };
-  pairing: {
-    paired: boolean;
-    chat: { username: string | null; firstName: string | null; pairedAt: string } | null;
-  };
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type TelegramPairing = {
-  url: string;
-  code: string;
-  expiresAt: string;
-};
-
-function requiredString(record: Record<string, unknown>, key: string): string {
-  const value = record[key];
-  if (typeof value !== "string") throw new Error("Telegram connection response was incomplete.");
-  return value;
-}
-
-function nullableString(record: Record<string, unknown>, key: string): string | null {
-  const value = record[key];
-  if (typeof value !== "string" && value !== null) throw new Error("Telegram connection response was incomplete.");
-  return value;
-}
-
-function parseTelegramConnectionValue(value: unknown): TelegramConnection {
-  if (!isRecord(value) || !isRecord(value.bot) || !isRecord(value.worker) || !isRecord(value.webhook) || !isRecord(value.pairing)) {
-    throw new Error("Telegram connection response was incomplete.");
-  }
-  const { bot, worker, webhook, pairing } = value;
-  const chat = pairing.chat;
-  if (
-    (value.status !== "active" && value.status !== "error")
-    || typeof value.connected !== "boolean"
-    || typeof webhook.registered !== "boolean"
-    || typeof pairing.paired !== "boolean"
-    || (chat !== null && !isRecord(chat))
-  ) {
-    throw new Error("Telegram connection response was incomplete.");
-  }
-  return {
-    id: requiredString(value, "id"),
-    status: value.status,
-    connected: value.connected,
-    bot: {
-      id: requiredString(bot, "id"),
-      username: nullableString(bot, "username"),
-      displayName: requiredString(bot, "displayName"),
-    },
-    worker: {
-      id: requiredString(worker, "id"),
-      name: requiredString(worker, "name"),
-      status: requiredString(worker, "status"),
-    },
-    webhook: {
-      registered: webhook.registered,
-      lastReceivedAt: nullableString(webhook, "lastReceivedAt"),
-      lastError: nullableString(webhook, "lastError"),
-    },
-    pairing: {
-      paired: pairing.paired,
-      chat: chat === null ? null : {
-        username: nullableString(chat, "username"),
-        firstName: nullableString(chat, "firstName"),
-        pairedAt: requiredString(chat, "pairedAt"),
-      },
-    },
-    createdAt: requiredString(value, "createdAt"),
-    updatedAt: requiredString(value, "updatedAt"),
-  };
-}
-
-function parseTelegramConnectionPayload(payload: unknown): TelegramConnection | null {
-  if (!isRecord(payload) || !("connection" in payload)) {
-    throw new Error("Telegram connection response was incomplete.");
-  }
-  return payload.connection === null ? null : parseTelegramConnectionValue(payload.connection);
-}
-
-export function useTelegramConnection(enabled: boolean) {
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useQuery({
-    enabled: enabled && Boolean(orgId),
-    queryKey: mcpConnectionQueryKeys.telegram(orgId),
-    retry: false,
-    queryFn: async (): Promise<TelegramConnection | null> => {
-      let connection: TelegramConnection | null = null;
-      let loaded = false;
-      await runReauthableAction("load-telegram-connection", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection",
-          { headers: getOrgScopeHeaders(requireOrgId(orgId)) },
-          15000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to load Telegram (${response.status}).`);
-        connection = parseTelegramConnectionPayload(payload);
-        loaded = true;
-      });
-      if (!loaded) throw new Error("Telegram connection response was incomplete.");
-      return connection;
-    },
-  });
-}
-
-export function useSaveTelegramConnection() {
-  const queryClient = useQueryClient();
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useMutation({
-    mutationFn: async (input: { botToken: string; workerId: string }): Promise<TelegramConnection> => {
-      let connection: TelegramConnection | null = null;
-      await runReauthableAction("save-telegram-connection", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection",
-          { method: "PUT", headers: getOrgScopeHeaders(requireOrgId(orgId)), body: JSON.stringify(input) },
-          30000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to connect Telegram (${response.status}).`);
-        connection = parseTelegramConnectionPayload(payload);
-      });
-      if (!connection) throw new Error("Telegram connection response was incomplete.");
-      return connection;
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.telegram(orgId) }),
-  });
-}
-
-export function useCreateTelegramPairing() {
-  const queryClient = useQueryClient();
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useMutation({
-    mutationFn: async (): Promise<TelegramPairing> => {
-      let pairing: TelegramPairing | null = null;
-      await runReauthableAction("create-telegram-pairing", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection/pairing",
-          { method: "POST", headers: getOrgScopeHeaders(requireOrgId(orgId)), body: JSON.stringify({}) },
-          15000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to create Telegram pairing (${response.status}).`);
-        if (!isRecord(payload) || !isRecord(payload.pairing)) throw new Error("Telegram pairing response was incomplete.");
-        pairing = {
-          url: requiredString(payload.pairing, "url"),
-          code: requiredString(payload.pairing, "code"),
-          expiresAt: requiredString(payload.pairing, "expiresAt"),
-        };
-      });
-      if (!pairing) throw new Error("Telegram pairing response was incomplete.");
-      return pairing;
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.telegram(orgId) }),
-  });
-}
-
-export function useDeleteTelegramConnection() {
-  const queryClient = useQueryClient();
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useMutation({
-    mutationFn: async (): Promise<void> => {
-      await runReauthableAction("delete-telegram-connection", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection",
-          { method: "DELETE", headers: getOrgScopeHeaders(requireOrgId(orgId)) },
-          20000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to disconnect Telegram (${response.status}).`);
-      });
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.telegram(orgId) }),
   });
 }
 

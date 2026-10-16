@@ -3,12 +3,22 @@ import { useMemo, type ReactNode } from "react";
 import { Cpu } from "lucide-react";
 
 import { t } from "../../../../i18n";
-import { Button } from "@/components/ui/button";
 
-import type { ExtensionInventoryFilter } from "../extension-taxonomy";
+import type { ExtensionInventoryFilter, ExtensionInventoryState } from "../extension-taxonomy";
 import { PluginsView, type PluginsExtensionsStore } from "./plugins-view";
 
-export type ExtensionsSection = "all" | "apps" | "connections" | "mcps" | "skills" | "plugins";
+export type ExtensionsSection =
+  | "all"
+  | "apps"
+  | "connections"
+  | "mcps"
+  | "skills"
+  | "commands"
+  | "agents"
+  | "plugins"
+  | "needs-sign-in"
+  | "needs-admin-setup"
+  | "ready";
 
 /** Sections are the URL spelling of the inventory filters. */
 function filterForSection(section: ExtensionsSection | undefined): ExtensionInventoryFilter {
@@ -21,6 +31,10 @@ function filterForSection(section: ExtensionsSection | undefined): ExtensionInve
       return "mcp";
     case "skills":
       return "skill";
+    case "commands":
+      return "command";
+    case "agents":
+      return "agent";
     case "plugins":
       return "plugin";
     default:
@@ -38,11 +52,28 @@ function sectionForFilter(filter: ExtensionInventoryFilter): ExtensionsSection {
       return "mcps";
     case "skill":
       return "skills";
+    case "command":
+      return "commands";
+    case "agent":
+      return "agents";
     case "plugin":
       return "plugins";
     case "all":
       return "all";
   }
+}
+
+function stateForSection(section: ExtensionsSection | undefined): ExtensionInventoryState {
+  if (section === "needs-sign-in") return "needs_signin";
+  if (section === "needs-admin-setup") return "needs_admin_setup";
+  if (section === "ready") return "ready";
+  return "all";
+}
+
+function sectionForState(state: Exclude<ExtensionInventoryState, "all">): ExtensionsSection {
+  if (state === "needs_signin") return "needs-sign-in";
+  if (state === "needs_admin_setup") return "needs-admin-setup";
+  return "ready";
 }
 
 type SuggestedPlugin = {
@@ -64,6 +95,8 @@ type SuggestedPlugin = {
 
 export type ExtensionsViewProps = {
   busy: boolean;
+  /** Hide the view's own description line (the settings shell already shows the tab description in-pane). */
+  hideDescription?: boolean;
   selectedWorkspaceRoot: string;
   isRemoteWorkspace: boolean;
   canEditPlugins: boolean;
@@ -71,13 +104,15 @@ export type ExtensionsViewProps = {
   accessHint?: string | null;
   suggestedPlugins: SuggestedPlugin[];
   extensions: PluginsExtensionsStore;
-  mcpConnectedAppsCount: number;
   /** The MCP view (quick-connect grid + configured servers). Skills are injected into it. */
   mcpView: (routing: {
     initialFilter: ExtensionInventoryFilter;
     onFilterChange: (filter: ExtensionInventoryFilter) => void;
+    initialState: ExtensionInventoryState;
+    onStateChange: (state: ExtensionInventoryState, filter: ExtensionInventoryFilter) => void;
     detailId: string | null;
     onDetailIdChange?: (id: string | null) => void;
+    onRefresh: () => void;
   }) => ReactNode;
   onRefresh: () => void;
   initialSection?: ExtensionsSection;
@@ -93,47 +128,36 @@ export function ExtensionsView(props: ExtensionsViewProps) {
     [props.extensions],
   );
   const initialFilter = filterForSection(props.initialSection);
+  const initialState = stateForSection(props.initialSection);
   const setFilterRoute = (filter: ExtensionInventoryFilter) => {
+    if (initialState !== "all") return;
     props.setSectionRoute?.(sectionForFilter(filter));
+  };
+  const setStateRoute = (state: ExtensionInventoryState, filter: ExtensionInventoryFilter) => {
+    props.setSectionRoute?.(state === "all" ? sectionForFilter(filter) : sectionForState(state));
   };
   const detailId = props.detailId ?? null;
   const mcpRouting = {
     initialFilter,
     onFilterChange: setFilterRoute,
+    initialState,
+    onStateChange: setStateRoute,
     detailId,
     onDetailIdChange: props.onDetailIdChange,
+    onRefresh: props.onRefresh,
   };
-
-  if (detailId) {
-    return <>{props.mcpView(mcpRouting)}</>;
-  }
 
   return (
     <section className="space-y-6 max-w-3xl w-full animate-in fade-in duration-300">
-      <div className="flex items-center justify-between">
-        <div className="flex min-w-0 flex-col gap-1">
-          <p className="text-sm text-dls-secondary">
-            {t("extensions.inventory_description")}
-          </p>
-          {props.mcpConnectedAppsCount > 0 ? (
-            <div className="mt-1 inline-flex w-fit items-center gap-2 rounded-full bg-green-3 px-3 py-1">
-              <div className="size-2 rounded-full bg-green-9" />
-              <span className="text-xs font-medium text-green-11">
-                {t("extensions.app_count", { count: props.mcpConnectedAppsCount })}
-              </span>
-            </div>
-          ) : null}
-        </div>
-        <Button variant="outline" onClick={props.onRefresh}>
-          {t("common.refresh")}
-        </Button>
-      </div>
+      {detailId || props.hideDescription === true ? null : (
+        <p className="text-sm text-dls-secondary">
+          {t("extensions.inventory_description")}
+        </p>
+      )}
 
-      {/* Runtime extensions and organization-assigned capabilities share one inventory. */}
       {props.mcpView(mcpRouting)}
 
-      {/* OpenCode plugins -- advanced, collapsed */}
-      {pluginCount > 0 ? (
+      {!detailId && pluginCount > 0 && initialState === "all" ? (
         <details className="group" open={props.initialSection === "plugins"}>
           <summary className="flex cursor-pointer items-center gap-2 rounded-lg px-1 py-2 text-sm font-medium text-dls-secondary transition-colors hover:text-dls-text">
             <Cpu size={14} />

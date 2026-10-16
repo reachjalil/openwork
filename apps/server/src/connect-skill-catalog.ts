@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
+import {
+  escapeXml,
+  isRecord,
+  jsonRpcResult,
+  mcpPost,
+  stringHeaders,
+  type McpFetch,
+} from "./connect-mcp-transport.js";
 import { readConnectCloudMcp, writeConnectCloudMcp } from "./connect-state.js";
 import { readRuntimeMcpConfig } from "./runtime-opencode-config-store.js";
 import { externalFetch } from "./server-fetch.js";
@@ -26,48 +34,7 @@ const skillIndexSchema = z.object({
 }).passthrough();
 
 export type OpenWorkConnectSkill = z.infer<typeof skillIndexSchema>["skills"][number];
-type McpFetch = (input: string, init?: RequestInit) => Promise<Response>;
 const catalogCache = new Map<string, { expiresAt: number; value: Promise<OpenWorkConnectSkill[] | null> }>();
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function stringHeaders(value: unknown): Record<string, string> {
-  if (!isRecord(value)) return {};
-  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
-}
-
-function parseJsonOrText(raw: string): unknown {
-  try { return JSON.parse(raw); } catch { return raw; }
-}
-
-async function readMcpPayload(response: Response): Promise<unknown> {
-  const raw = await response.text();
-  if (!raw.trim()) return null;
-  if (!response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) return parseJsonOrText(raw);
-  for (const frame of raw.split(/\r?\n\r?\n/)) {
-    const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
-    if (data) return parseJsonOrText(data);
-  }
-  return null;
-}
-
-function jsonRpcResult(payload: unknown): Record<string, unknown> | null {
-  const record = Array.isArray(payload) ? payload.find(isRecord) : payload;
-  if (!isRecord(record) || record.error !== undefined || !isRecord(record.result)) return null;
-  return record.result;
-}
-
-async function mcpPost(fetcher: McpFetch, url: string, headers: Record<string, string>, body: unknown) {
-  const response = await fetcher(url, {
-    method: "POST",
-    headers: { accept: "application/json, text/event-stream", "content-type": "application/json", ...headers },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(5_000),
-  });
-  return { response, payload: await readMcpPayload(response) };
-}
 
 /**
  * Read the standards-shaped skill index through one openwork-cloud config.
@@ -165,10 +132,6 @@ export function resetOpenWorkConnectSkillCatalogCacheForTests(): void {
   catalogCache.clear();
 }
 
-function escapeXml(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
-}
-
 type InjectedMarketplaceSkill = {
   name: string;
   title: string;
@@ -184,6 +147,16 @@ function logInjectedMarketplaceSkills(skills: InjectedMarketplaceSkill[]): void 
     count: skills.length,
     skills,
   });
+}
+
+// Every request carries the whole catalog, so each rendered character is a
+// recurring prompt cost. Descriptions are discovery hints, not documentation;
+// the full SKILL.md arrives only when the capability is executed.
+const MAX_RENDERED_DESCRIPTION_CHARS = 360;
+
+function clampDescription(value: string): string {
+  if (value.length <= MAX_RENDERED_DESCRIPTION_CHARS) return value;
+  return `${value.slice(0, MAX_RENDERED_DESCRIPTION_CHARS - 1).trimEnd()}…`;
 }
 
 export function renderOpenWorkConnectSkillInstruction(skills: OpenWorkConnectSkill[]): string {
@@ -203,15 +176,17 @@ export function renderOpenWorkConnectSkillInstruction(skills: OpenWorkConnectSki
   ];
   for (const skill of skills) {
     const title = (skill.title ?? skill.name).replace(/\s+/g, " ").trim() || skill.name;
-    const description = skill.description.replace(/\s+/g, " ").trim() || title;
+    const description = clampDescription(skill.description.replace(/\s+/g, " ").trim()) || title;
+    // Prompt-size discipline: skip <title> when it repeats <name>, and omit
+    // <location> entirely — execution goes through <capability>, and the
+    // skill:// URL is derivable server-side when anything ever needs it.
     const entry = [
       "  <skill>",
-      `    <title>${escapeXml(title)}</title>`,
+      ...(title !== skill.name ? [`    <title>${escapeXml(title)}</title>`] : []),
       `    <name>${escapeXml(skill.name)}</name>`,
       `    <description>${escapeXml(description)}</description>`,
       ...(skill.marketplaceName ? [`    <marketplace>${escapeXml(skill.marketplaceName.replace(/\s+/g, " ").trim())}</marketplace>`] : []),
       ...(skill.pluginName ? [`    <plugin>${escapeXml(skill.pluginName.replace(/\s+/g, " ").trim())}</plugin>`] : []),
-      `    <location>${escapeXml(skill.url)}</location>`,
       `    <capability>${escapeXml(skill.capability)}</capability>`,
       "  </skill>",
     ];

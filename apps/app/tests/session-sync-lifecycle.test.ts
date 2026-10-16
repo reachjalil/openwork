@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, jest, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, setSystemTime, test } from "bun:test";
 
 type SyncInput = {
   workspaceId: string;
@@ -16,8 +16,10 @@ type Subscription = {
 const subscriptions: Subscription[] = [];
 
 const {
+  __applySessionSyncEventForTest,
   __disposeWorkspaceSessionSyncForTest,
   __hasWorkspaceSessionSyncForTest,
+  __setWorkspaceSessionSyncStatusFetcherForTest,
   __setWorkspaceSessionSyncSubscriptionFactoryForTest,
   ensureWorkspaceSessionSync,
 } = await import("../src/react-app/domains/session/sync/session-sync");
@@ -56,12 +58,17 @@ async function waitForSubscriptions(count: number) {
   expect(subscriptions).toHaveLength(count);
 }
 
+beforeEach(() => {
+  __setWorkspaceSessionSyncStatusFetcherForTest(async () => ({}));
+});
+
 afterEach(() => {
   jest.useRealTimers();
   for (const syncInput of inputs) __disposeWorkspaceSessionSyncForTest(syncInput);
   inputs.length = 0;
   subscriptions.length = 0;
   __setWorkspaceSessionSyncSubscriptionFactoryForTest(null);
+  __setWorkspaceSessionSyncStatusFetcherForTest(null);
   setSystemTime();
   Object.defineProperty(globalThis, "setInterval", {
     configurable: true,
@@ -71,6 +78,29 @@ afterEach(() => {
 });
 
 describe("workspace session sync lifecycle", () => {
+  test("keeps a reattached observer after the older attachment releases", async () => {
+    __setWorkspaceSessionSyncSubscriptionFactoryForTest(createSubscription);
+    const syncInput = input("https://one.example/opencode", "token");
+    const onSessionStatus = jest.fn();
+    const observedInput = { ...syncInput, onSessionStatus };
+
+    const releaseFirst = ensureWorkspaceSessionSync(observedInput);
+    await waitForSubscriptions(1);
+    const releaseSecond = ensureWorkspaceSessionSync(observedInput);
+    releaseFirst();
+
+    __applySessionSyncEventForTest(syncInput, {
+      type: "session.status",
+      properties: { sessionID: "session-active", status: { type: "busy" } },
+    });
+
+    expect(onSessionStatus).toHaveBeenCalledWith({
+      sessionId: "session-active",
+      status: { type: "busy" },
+    });
+    releaseSecond();
+  });
+
   test("reuses the stream when immediately re-ensured after release", async () => {
     __setWorkspaceSessionSyncSubscriptionFactoryForTest(createSubscription);
     const syncInput = input("https://one.example/opencode", "token");
