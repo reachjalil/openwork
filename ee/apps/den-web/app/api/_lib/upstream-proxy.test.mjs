@@ -5,18 +5,21 @@ import { NextRequest } from "next/server";
 import { setStructuredLogSink, useJsonStdoutStructuredLogSink } from "../../../observability/runtime-logger.ts";
 
 const previousDenApiBase = process.env.DEN_API_BASE;
+const previousCloudInstanceOriginSuffixes = process.env.DEN_CLOUD_INSTANCE_ORIGIN_SUFFIXES;
 const previousDenBaseUrl = process.env.DEN_BASE_URL;
 const previousDenWebPublicOrigin = process.env.DEN_WEB_PUBLIC_ORIGIN;
 
 describe("Den upstream proxy", () => {
   let server;
   let observed = null;
+  let upstreamRequests = 0;
   let logs = [];
 
   beforeAll(() => {
     server = Bun.serve({
       port: 0,
       async fetch(request) {
+        upstreamRequests += 1;
         const url = new URL(request.url);
         observed = {
           method: request.method,
@@ -85,6 +88,7 @@ describe("Den upstream proxy", () => {
           status: 207,
           headers: {
             "content-type": "text/plain",
+            "access-control-allow-credentials": "true",
             "set-cookie": "sid=abc; Path=/; HttpOnly",
             "x-upstream-result": "ok",
           },
@@ -95,6 +99,9 @@ describe("Den upstream proxy", () => {
   });
 
   beforeEach(() => {
+    delete process.env.DEN_CLOUD_INSTANCE_ORIGIN_SUFFIXES;
+    observed = null;
+    upstreamRequests = 0;
     delete process.env.DEN_BASE_URL;
     delete process.env.DEN_WEB_PUBLIC_ORIGIN;
     logs = [];
@@ -106,6 +113,8 @@ describe("Den upstream proxy", () => {
   });
 
   afterAll(() => {
+    if (previousCloudInstanceOriginSuffixes === undefined) delete process.env.DEN_CLOUD_INSTANCE_ORIGIN_SUFFIXES;
+    else process.env.DEN_CLOUD_INSTANCE_ORIGIN_SUFFIXES = previousCloudInstanceOriginSuffixes;
     useJsonStdoutStructuredLogSink();
     server.stop(true);
     if (previousDenApiBase === undefined) {
@@ -142,30 +151,15 @@ describe("Den upstream proxy", () => {
 
     expect(response.status).toBe(204);
     expect(response.headers.get("access-control-allow-origin")).toBe(INSTANCE_ORIGIN);
-    expect(response.headers.get("access-control-allow-credentials")).toBe("true");
-    expect(response.headers.get("access-control-allow-headers")).toBe("authorization,content-type");
+    expect(response.headers.get("access-control-allow-credentials")).toBeNull();
+    expect(response.headers.get("access-control-allow-headers")).toBe(
+      "authorization,content-type,x-openwork-org-id,x-openwork-legacy-org-id,x-request-id,accept",
+    );
     expect(response.headers.get("vary")).toContain("Origin");
+    expect(upstreamRequests).toBe(0);
   });
 
-  test("reflects the instance origin on the real response and strips cookies upstream", async () => {
-    const { proxyUpstream } = await import("./upstream-proxy.ts");
-    const request = new NextRequest("https://app.example.com/api/den/v1/me", {
-      method: "GET",
-      headers: {
-        origin: INSTANCE_ORIGIN,
-        authorization: "Bearer tok_instance",
-        cookie: "ow_session=must_not_leak",
-      },
-    });
-
-    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
-
-    expect(response.headers.get("access-control-allow-origin")).toBe(INSTANCE_ORIGIN);
-    // The whole safety argument: an instance-origin call is bearer-only and can
-    // never ride the viewer's dashboard session.
-    expect(observed.cookie).toBeNull();
-    expect(observed.authorization).toBe("Bearer tok_instance");
-  });
+  
 
   test("does not reflect a non-instance origin and keeps its cookies", async () => {
     const { proxyUpstream } = await import("./upstream-proxy.ts");
@@ -316,57 +310,7 @@ describe("Den upstream proxy", () => {
     }
   });
 
-  test("passes method, path, query, body, cookies, auth, status, and headers through", async () => {
-    const { proxyUpstream } = await import("./upstream-proxy.ts");
-    const request = new NextRequest("https://app.example.com/api/den/v1/me?include=org", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer tok_test",
-        cookie: "ow_session=sess_test",
-        "content-type": "application/json",
-        "x-custom-proxy-test": "kept",
-      },
-      body: JSON.stringify({ ok: true }),
-    });
-
-    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
-
-    expect(observed).toEqual({
-      method: "POST",
-      path: "/v1/me?include=org",
-      body: JSON.stringify({ ok: true }),
-      cookie: "ow_session=sess_test",
-      authorization: "Bearer tok_test",
-      custom: "kept",
-      forwarded: null,
-      forwardedHost: "app.example.com",
-      forwardedPrefix: "/api/den",
-      forwardedProto: "https",
-      traceparent: null,
-      tracestate: null,
-    });
-    expect(response.status).toBe(207);
-    expect(response.headers.get("x-upstream-result")).toBeNull();
-    expect(response.headers.get("set-cookie")).toContain("sid=abc");
-    expect(await response.text()).toBe("proxied");
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toMatchObject({
-      level: "info",
-      message: "den-web upstream proxy completed",
-      fields: {
-        route_prefix: "/api/den",
-        method: "POST",
-        upstream_path: "/v1/me",
-        status: 207,
-      },
-    });
-    expect(typeof logs[0].fields.duration_ms).toBe("number");
-    const serializedLog = JSON.stringify(logs[0]);
-    expect(serializedLog).not.toContain("include=org");
-    expect(serializedLog).not.toContain("tok_test");
-    expect(serializedLog).not.toContain("sess_test");
-    expect(serializedLog).not.toContain(JSON.stringify({ ok: true }));
-  });
+  
 
   test("strips internal upstream response headers and rewrites upstream URLs", async () => {
     const { proxyUpstream } = await import("./upstream-proxy.ts");
@@ -533,5 +477,135 @@ describe("Den upstream proxy", () => {
     }
 
     expect(observed.traceparent).toBe("00-0af7651916cd43dd8448eb211c80319c-b9c7c989f97918e1-01");
+  });
+test("keeps reflected Den routes bearer-only in both directions", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/v1/me", {
+      method: "GET",
+      headers: {
+        origin: INSTANCE_ORIGIN,
+        authorization: "Bearer tok_instance",
+        cookie: "ow_session=must_not_leak",
+      },
+    });
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(response.headers.get("access-control-allow-origin")).toBe(INSTANCE_ORIGIN);
+    expect(response.headers.get("access-control-allow-credentials")).toBeNull();
+    expect(response.headers.getSetCookie()).toEqual([]);
+    // The whole safety argument: an instance-origin call is bearer-only and can
+    // never ride the viewer's dashboard session.
+    expect(observed.cookie).toBeNull();
+    expect(observed.authorization).toBe("Bearer tok_instance");
+    expect(response.status).toBe(207);
+    expect(await response.text()).toBe("proxied");
+  });
+
+test("rejects unsupported reflected-origin preflight headers", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/v1/me", {
+      method: "OPTIONS",
+      headers: {
+        origin: INSTANCE_ORIGIN,
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "authorization,x-not-supported",
+      },
+    });
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("access-control-allow-origin")).toBeNull();
+    expect(upstreamRequests).toBe(0);
+  });
+
+test("rejects session authentication routes tunneled through the Den proxy", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/api/auth/get-session", {
+      method: "GET",
+      headers: {
+        origin: INSTANCE_ORIGIN,
+        authorization: "Bearer tok_instance",
+        cookie: "ow_session=must_not_reach_auth",
+      },
+    });
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: "Session authentication routes are unavailable to reflected origins.",
+    });
+    expect(upstreamRequests).toBe(0);
+  });
+
+test("fails closed for malformed explicit instance-origin suffixes", async () => {
+    process.env.DEN_CLOUD_INSTANCE_ORIGIN_SUFFIXES = "daytonaproxy01.net,.daytonaproxy01.net";
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/v1/me", {
+      method: "GET",
+      headers: { origin: INSTANCE_ORIGIN },
+    });
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(response.headers.get("access-control-allow-origin")).toBeNull();
+    expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+  });
+
+test("preserves trusted first-party session requests and responses", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/v1/me?include=org", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer tok_test",
+        cookie: "ow_session=sess_test",
+        "content-type": "application/json",
+        "x-custom-proxy-test": "kept",
+      },
+      body: JSON.stringify({ ok: true }),
+    });
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(observed).toEqual({
+      method: "POST",
+      path: "/v1/me?include=org",
+      body: JSON.stringify({ ok: true }),
+      cookie: "ow_session=sess_test",
+      authorization: "Bearer tok_test",
+      custom: "kept",
+      forwarded: null,
+      forwardedHost: "app.example.com",
+      forwardedPrefix: "/api/den",
+      forwardedProto: "https",
+      traceparent: null,
+      tracestate: null,
+    });
+    expect(response.status).toBe(207);
+    expect(response.headers.get("x-upstream-result")).toBeNull();
+    expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(response.headers.getSetCookie()).toEqual([
+      "sid=abc; Path=/; HttpOnly",
+    ]);
+    expect(await response.text()).toBe("proxied");
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      level: "info",
+      message: "den-web upstream proxy completed",
+      fields: {
+        route_prefix: "/api/den",
+        method: "POST",
+        upstream_path: "/v1/me",
+        status: 207,
+      },
+    });
+    expect(typeof logs[0].fields.duration_ms).toBe("number");
+    const serializedLog = JSON.stringify(logs[0]);
+    expect(serializedLog).not.toContain("include=org");
+    expect(serializedLog).not.toContain("tok_test");
+    expect(serializedLog).not.toContain("sess_test");
+    expect(serializedLog).not.toContain(JSON.stringify({ ok: true }));
   });
 });
