@@ -1,4 +1,6 @@
-import { attachSurface, describeAppState, isInteractive, probeAppState } from "@openwork/cdp";
+import { readFile } from "node:fs/promises";
+import { timed } from "@openwork/timeline";
+import { attachSurface, describeAppState, dumpScreenState, isInteractive, probeAppStateOnSurface } from "@openwork/cdp";
 import { resolveHost } from "./resolve.ts";
 import type { AppStateProbe, AppSurfaceState, AttachedSurface, Surface, SurfaceHandle } from "@openwork/cdp";
 import type { Host } from "./types.ts";
@@ -16,15 +18,43 @@ function logCleanupError(name: string, error: unknown): void {
   console.warn(`[openwork/evals] Desktop ${name} cleanup failed: ${messageText(error)}`);
 }
 
+async function appendDesktopLog(error: unknown, handle: SurfaceHandle): Promise<unknown> {
+  const logPath = handle.meta?.log;
+  if (!logPath) return error;
+  try {
+    const log = await readFile(logPath, "utf8");
+    if (!log.trim()) return error;
+    const tail = log.trimEnd().split(/\r?\n/).slice(-40).join("\n");
+    return new Error(`${messageText(error)}\n\nLast 40 lines of ${logPath}:\n${tail}`, { cause: error });
+  } catch {
+    return error;
+  }
+}
+
 export interface DesktopOptions {
   name?: string;
   mode?: "spawn" | "attach";
+  /** Explicit CDP endpoint for attach mode; falls back to OPENWORK_EVAL_CDP_URL. */
+  cdpUrl?: string;
+  /**
+   * Where this desktop runs. Defaults to the ambient host (`resolveHost()`).
+   * Pass one from `localHost()` / `daytonaSandbox(id)` to place it explicitly —
+   * that is the only way a spec can put two desktops in two sandboxes, or the
+   * app and the browser in different places.
+   */
+  host?: Host;
   bootstrap?: {
     baseUrl: string;
     apiBaseUrl?: string;
     requireSignin?: boolean;
   };
   env?: Record<string, string>;
+  /** Root package script used for a source Electron launch. */
+  devCommand?: "dev" | "dev:electron";
+  /** Skip host-side sidecar/helper preparation for an explicitly constrained launch. */
+  prepareSharedResources?: boolean;
+  /** Exact caller-owned Electron profile root, for restart scenarios. */
+  profileDir?: string;
   timeoutMs?: number;
 }
 
@@ -36,27 +66,35 @@ export interface AppReadiness {
 
 export interface DesktopHandle extends AttachedSurface {
   readiness: AppReadiness;
+  /**
+   * The workspace root on the host running THIS app — use it for workspace
+   * paths instead of `process.cwd()`, which is the driver's filesystem and may
+   * not exist where the app runs. Null only in `mode: "attach"`, where the
+   * host is unknown.
+   */
+  workspaceRoot: string | null;
   stop(): Promise<void>;
 }
 
 async function waitForReadiness(app: Surface, timeoutMs: number): Promise<AppReadiness> {
   const deadline = Date.now() + timeoutMs;
-  // Give each probe room to answer while the app is busy; the poll's own
-  // deadline is what bounds the wait, not a per-call default.
-  const probeTimeoutMs = Math.min(Math.max(timeoutMs, 20_000), 120_000);
+  // Short per-probe timeout so a briefly-busy renderer is retried rather than
+  // consuming the whole readiness budget in one stuck call.
   let last: AppStateProbe = { controlReady: false, transitional: null, surface: null, workspaceId: null, route: "", text: "" };
   while (Date.now() < deadline) {
     try {
-      last = await probeAppState(app.client, { timeoutMs: probeTimeoutMs });
+      last = await probeAppStateOnSurface(app, { timeoutMs: Math.min(8_000, Math.max(1, deadline - Date.now())) });
       if (isInteractive(last) && last.surface) {
         return { state: last.surface, workspaceId: last.workspaceId, route: last.route };
       }
     } catch {
       // Navigations briefly destroy the execution context while the app boots.
     }
-    await sleep(POLL_INTERVAL_MS);
+    await sleep(Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
   }
-  throw new Error(`OpenWork desktop did not become ready after ${timeoutMs}ms: ${describeAppState(last)}`);
+  throw new Error(
+    `OpenWork desktop did not become ready after ${timeoutMs}ms: ${describeAppState(last)} On screen: ${await dumpScreenState(app)}.`,
+  );
 }
 
 async function closeSpawnedSurface(
@@ -78,9 +116,9 @@ export async function desktop(opts: DesktopOptions = {}): Promise<DesktopHandle>
   let handle: SurfaceHandle;
 
   if (mode === "attach") {
-    const cdpUrl = process.env.OPENWORK_EVAL_CDP_URL?.trim();
+    const cdpUrl = opts.cdpUrl?.trim() || process.env.OPENWORK_EVAL_CDP_URL?.trim();
     if (!cdpUrl) {
-      throw new Error('desktop({ mode: "attach" }) requires OPENWORK_EVAL_CDP_URL to point at a running Electron app.');
+      throw new Error('desktop({ mode: "attach" }) requires cdpUrl or OPENWORK_EVAL_CDP_URL to point at a running Electron app.');
     }
     handle = {
       name: opts.name ?? "attached-app",
@@ -89,18 +127,22 @@ export async function desktop(opts: DesktopOptions = {}): Promise<DesktopHandle>
       cdpUrl,
     };
   } else {
-    host = await resolveHost();
+    host = opts.host ?? await resolveHost();
     handle = await host.spawnElectron(opts.name ?? "spec", {
       profile: "fresh",
+      profileDir: opts.profileDir,
       bootstrap: opts.bootstrap,
       env: opts.env,
+      devCommand: opts.devCommand,
+      prepareSharedResources: opts.prepareSharedResources,
     });
   }
 
   let attached: AttachedSurface | null = null;
   try {
-    attached = await attachSurface(handle, { timeoutMs });
-    const readiness = await waitForReadiness(attached, timeoutMs);
+    const surface = await attachSurface(handle, { timeoutMs });
+    attached = surface;
+    const readiness = await timed("app.readiness", () => waitForReadiness(surface, timeoutMs), handle.name);
     let stopped = false;
     const stop = async (): Promise<void> => {
       if (stopped) return;
@@ -114,12 +156,14 @@ export async function desktop(opts: DesktopOptions = {}): Promise<DesktopHandle>
       handle: attached.handle,
       client: attached.client,
       readiness,
+      workspaceRoot: host?.workspaceRoot ?? null,
       stop,
       [Symbol.asyncDispose]: dispose,
     };
   } catch (error) {
+    const readinessError = attached ? await appendDesktopLog(error, handle) : error;
     await closeSpawnedSurface(attached, host, handle)
       .catch((cleanupError: unknown) => logCleanupError(handle.name, cleanupError));
-    throw error;
+    throw readinessError;
   }
 }

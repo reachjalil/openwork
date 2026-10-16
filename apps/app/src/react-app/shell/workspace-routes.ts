@@ -15,6 +15,14 @@ export function workspaceSettingsRoute(
   return `/workspace/${encodeURIComponent(workspaceId.trim())}/settings/${tab}`;
 }
 
+export function automationsRoute() {
+  return "/automations";
+}
+
+export function dashboardRoute() {
+  return "/dashboard";
+}
+
 export function globalSettingsRoute(tab: SettingsTab) {
   return `/settings/${tab}`;
 }

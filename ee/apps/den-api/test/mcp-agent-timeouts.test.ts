@@ -7,6 +7,7 @@ import {
   BUILTIN_ADD_TO_MARKETPLACE_CAPABILITY,
   BUILTIN_ADD_USER_TO_MARKETPLACE_CAPABILITY,
   BUILTIN_CREATE_SKILL_CAPABILITY,
+  BUILTIN_SHARE_PLUGIN_CAPABILITY,
   BUILTIN_SKILL_DESCRIPTORS,
   executeBuiltinSkillCapability,
   searchBuiltinSkillCapabilities,
@@ -115,8 +116,12 @@ test("agent MCP server exposes steering instructions during initialize", async (
   await client.connect(transports.client)
 
   expect(client.getInstructions()).toBe(agentModule.AGENT_MCP_INSTRUCTIONS)
-  expect(client.getInstructions()).toContain("search_capabilities and execute_capability")
+  expect(client.getInstructions()).toContain("Use create_skill")
+  expect(client.getInstructions()).toContain("do not route these flows through execute_capability, postPlugins, or postConfigObjectsVersions")
+  expect(client.getInstructions()).toContain("update_skill to publish a new immutable version")
+  expect(client.getInstructions()).toContain("execute that exact match once: it returns the live status and renders an actionable connection card")
   expect(client.getInstructions()).toContain("create-skill")
+  expect(client.getInstructions()).toContain("share-plugin")
   expect(client.getInstructions()).toContain("add-to-marketplace")
   expect(client.getInstructions()).toContain("add-user-to-marketplace")
   expect(client.getInstructions()).toContain("add a public GitHub plugin to an organization marketplace")
@@ -164,6 +169,7 @@ test("agent MCP server exposes a standards-shaped remote skill index", () => {
 
 test("built-in cloud skills are searchable and executable as skill capabilities", () => {
   expect(searchBuiltinSkillCapabilities("create a skill").map((match) => match.name)).toContain(BUILTIN_CREATE_SKILL_CAPABILITY)
+  expect(searchBuiltinSkillCapabilities("share this skill with my team").map((match) => match.name)).toContain(BUILTIN_SHARE_PLUGIN_CAPABILITY)
   expect(searchBuiltinSkillCapabilities("add this to marketplace").map((match) => match.name)).toContain(BUILTIN_ADD_TO_MARKETPLACE_CAPABILITY)
   expect(searchBuiltinSkillCapabilities("add this user to the marketplace").map((match) => match.name)).toContain(BUILTIN_ADD_USER_TO_MARKETPLACE_CAPABILITY)
   expect(searchBuiltinSkillCapabilities("calendar events")).toEqual([])
@@ -175,8 +181,11 @@ test("built-in cloud skills are searchable and executable as skill capabilities"
     provenance: "Built into OpenWork Cloud.",
   })
   expect(createSkill?.content).toContain("name: create-skill")
-  expect(createSkill?.content).toContain("postPlugins")
-  expect(createSkill?.content).toContain("Do not send `marketplaceId` or `orgWide`")
+  expect(createSkill?.content).toContain("openwork-cloud_create_skill")
+  expect(createSkill?.content).toContain("Do not route this flow through `execute_capability` or `postPlugins`")
+  expect(createSkill?.content).toContain("`duplicate_plugin`")
+  expect(createSkill?.content).toContain("share-plugin")
+  expect(createSkill?.content).toContain("Do not attach it to a marketplace or grant org-wide access")
   expect(createSkill?.content).not.toContain("Set organization-wide access or a marketplace")
 
   const addToMarketplace = executeBuiltinSkillCapability(BUILTIN_ADD_TO_MARKETPLACE_CAPABILITY)
@@ -188,6 +197,12 @@ test("built-in cloud skills are searchable and executable as skill capabilities"
   expect(addUser?.content).toContain("name: add-user-to-marketplace")
   expect(addUser?.content).toContain("postMarketplacesAccess")
   expect(addUser?.content).toContain("orgMembershipId")
+
+  const sharePlugin = executeBuiltinSkillCapability(BUILTIN_SHARE_PLUGIN_CAPABILITY)
+  expect(sharePlugin).toMatchObject({ kind: "skill", name: "Share Plugin" })
+  expect(sharePlugin?.content).toContain("name: share-plugin")
+  expect(sharePlugin?.content).toContain("postPluginsAccess")
+  expect(sharePlugin?.content).toContain('Use `"role": "viewer"` by default')
   expect(executeBuiltinSkillCapability("skill:missing")).toBeNull()
 })
 
@@ -444,7 +459,7 @@ test("capability discovery is marked read-only while generic execution remains g
   })
 })
 
-test("connection status ranks above unrelated callable tools without distorting relevance scores", () => {
+test("connection status only outranks equally relevant callable tools", () => {
   type ConnectionStatusMatch = CapabilityMatch & { kind: "connection_status" }
   const callableMatch: CapabilityMatch = {
     name: "slack_search_emojis",
@@ -471,6 +486,12 @@ test("connection status ranks above unrelated callable tools without distorting 
 
   matches.sort(compareCapabilityMatches)
 
+  expect(matches[0]?.name).toBe("slack_search_emojis")
+  expect(matches[0]?.score).toBe(20)
+
+  statusMatch.score = callableMatch.score
+  matches.sort(compareCapabilityMatches)
+
   expect(matches[0]?.kind).toBe("connection_status")
-  expect(matches[0]?.score).toBe(7)
+  expect(matches[0]?.score).toBe(20)
 })

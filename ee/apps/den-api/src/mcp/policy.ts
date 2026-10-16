@@ -12,7 +12,6 @@ const SAFE_INCLUDED_TAGS = new Set([
   "Workers",
   "Worker Runtime",
   "Worker Activity",
-  "Memory",
   "Config Objects",
   "Plugins",
   "Marketplaces",
@@ -20,6 +19,9 @@ const SAFE_INCLUDED_TAGS = new Set([
   "Desktop Policies",
   "GitHub",
   "Capability Sources",
+  "Automations",
+  "Codemode Runs",
+  "Workflows",
 ])
 
 const BLOCKED_OPERATION_IDS = new Set([
@@ -34,6 +36,7 @@ const BLOCKED_OPERATION_IDS = new Set([
   "postV1WorkersByWorkerIdTokens",
   "postOauthProvidersByProviderIdDisconnect",
   "postV1OauthProvidersByProviderIdDisconnect",
+  "mintAutomationRunnerToken",
 ])
 
 export type OpenApiOperation = {

@@ -77,8 +77,26 @@ export type GithubInstallStatePayload = {
   userId: string
 }
 
-const GITHUB_API_BASE = "https://api.github.com"
 const GITHUB_API_VERSION = "2022-11-28"
+const GITHUB_INSTALLATION_TOKEN_CACHE_TTL_MS = 55 * 60_000
+const GITHUB_INSTALLATION_TOKEN_REQUEST_TIMEOUT_MS = 15_000
+const GITHUB_REPOSITORY_MAX_PAGES = 30
+const GITHUB_REPOSITORY_PAGE_SIZE = 100
+const githubInstallationTokenCache = new Map<string, { token: string; expiresAtMs: number }>()
+const githubInstallationTokenRequests = new Map<string, Promise<string>>()
+let githubInstallationTokenCacheGeneration = 0
+
+export function clearGithubInstallationTokenCache() {
+  githubInstallationTokenCacheGeneration += 1
+  githubInstallationTokenCache.clear()
+  githubInstallationTokenRequests.clear()
+}
+
+// Overridable so @openwork/testkit specs can point the connector at a mock GitHub witness.
+function githubApiBase(): string {
+  const override = process.env.GITHUB_CONNECTOR_API_BASE?.trim()
+  return override ? override.replace(/\/+$/, "") : "https://api.github.com"
+}
 
 function base64UrlEncode(value: unknown) {
   const buffer = typeof value === "string"
@@ -210,9 +228,10 @@ async function requestGithubJson<TResponse>(input: {
   method?: "GET" | "POST"
   path: string
   allowStatuses?: number[]
+  signal?: AbortSignal
 }) {
   const fetchFn = input.fetchFn ?? fetch
-  const response = await fetchFn(`${GITHUB_API_BASE}${input.path}`, {
+  const response = await fetchFn(`${githubApiBase()}${input.path}`, {
     headers: {
       Accept: "application/vnd.github+json",
       "User-Agent": "openwork-den-api",
@@ -220,6 +239,7 @@ async function requestGithubJson<TResponse>(input: {
       ...input.headers,
     },
     method: input.method ?? "GET",
+    signal: input.signal,
   })
 
   const text = await response.text()
@@ -304,7 +324,7 @@ export async function getGithubInstallationSummary(input: { config: GithubConnec
   } satisfies GithubInstallationSummary
 }
 
-async function createGithubInstallationAccessToken(input: { config: GithubConnectorAppConfig; fetchFn?: GithubFetch; installationId: number }) {
+async function createGithubInstallationAccessToken(input: { config: GithubConnectorAppConfig; fetchFn?: GithubFetch; installationId: number; requestTimeoutMs?: number }) {
   const jwt = createGithubAppJwt(input.config)
   const response = await requestGithubJson<{ token?: string }>({
     fetchFn: input.fetchFn,
@@ -313,6 +333,7 @@ async function createGithubInstallationAccessToken(input: { config: GithubConnec
     },
     method: "POST",
     path: `/app/installations/${input.installationId}/access_tokens`,
+    signal: AbortSignal.timeout(input.requestTimeoutMs ?? GITHUB_INSTALLATION_TOKEN_REQUEST_TIMEOUT_MS),
   })
 
   const token = typeof response.body?.token === "string" ? response.body.token : null
@@ -323,8 +344,40 @@ async function createGithubInstallationAccessToken(input: { config: GithubConnec
   return token
 }
 
-export async function getGithubInstallationAccessToken(input: { config: GithubConnectorAppConfig; fetchFn?: GithubFetch; installationId: number }) {
-  return createGithubInstallationAccessToken(input)
+export async function getGithubInstallationAccessToken(input: {
+  config: GithubConnectorAppConfig
+  fetchFn?: GithubFetch
+  installationId: number
+  nowMs?: number
+  requestTimeoutMs?: number
+}) {
+  const nowMs = input.nowMs ?? Date.now()
+  const generation = githubInstallationTokenCacheGeneration
+  const cacheKey = `${input.config.appId}:${input.installationId}`
+  const cached = githubInstallationTokenCache.get(cacheKey)
+  if (cached && cached.expiresAtMs > nowMs) {
+    return cached.token
+  }
+
+  const existingRequest = githubInstallationTokenRequests.get(cacheKey)
+  if (existingRequest) return existingRequest
+
+  const request = createGithubInstallationAccessToken(input)
+  githubInstallationTokenRequests.set(cacheKey, request)
+  try {
+    const token = await request
+    if (generation === githubInstallationTokenCacheGeneration) {
+      githubInstallationTokenCache.set(cacheKey, {
+        expiresAtMs: nowMs + GITHUB_INSTALLATION_TOKEN_CACHE_TTL_MS,
+        token,
+      })
+    }
+    return token
+  } finally {
+    if (githubInstallationTokenRequests.get(cacheKey) === request) {
+      githubInstallationTokenRequests.delete(cacheKey)
+    }
+  }
 }
 
 function normalizeGithubRepository(entry: unknown): GithubRepositorySummary | null {
@@ -357,39 +410,55 @@ function normalizeGithubRepository(entry: unknown): GithubRepositorySummary | nu
 }
 
 export async function listGithubInstallationRepositories(input: { config: GithubConnectorAppConfig; fetchFn?: GithubFetch; installationId: number }) {
-  const token = await createGithubInstallationAccessToken(input)
-  const response = await requestGithubJson<{ repositories?: unknown[] }>({
-    fetchFn: input.fetchFn,
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-    path: "/installation/repositories",
-  })
-
-  if (!Array.isArray(response.body.repositories)) {
-    return []
-  }
-
-  const repositories: GithubRepositorySummary[] = []
-  for (const entry of response.body.repositories) {
-    const normalized = normalizeGithubRepository(entry)
-    if (!normalized) {
-      continue
+  const token = await getGithubInstallationAccessToken(input)
+  const normalizedRepositories: GithubRepositorySummary[] = []
+  for (let page = 1; page <= GITHUB_REPOSITORY_MAX_PAGES; page += 1) {
+    const response = await requestGithubJson<{ repositories?: unknown[] }>({
+      fetchFn: input.fetchFn,
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      path: `/installation/repositories?per_page=${GITHUB_REPOSITORY_PAGE_SIZE}&page=${page}`,
+    })
+    const pageRepositories = response.body.repositories
+    if (!Array.isArray(pageRepositories) || pageRepositories.length === 0) {
+      break
     }
 
-    const manifest = await detectRepositoryManifest({
-      fetchFn: input.fetchFn,
-      ownerAndRepo: normalized.fullName,
-      token,
-    })
-
-    repositories.push({
-      ...normalized,
-      hasPluginManifest: manifest.manifestKind !== null,
-      manifestKind: manifest.manifestKind,
-      marketplacePluginCount: manifest.marketplacePluginCount,
-    })
+    for (const entry of pageRepositories) {
+      const normalized = normalizeGithubRepository(entry)
+      if (normalized) {
+        normalizedRepositories.push(normalized)
+      }
+    }
+    if (pageRepositories.length < GITHUB_REPOSITORY_PAGE_SIZE) {
+      break
+    }
   }
+
+  const repositories = new Array<GithubRepositorySummary>(normalizedRepositories.length)
+  let nextIndex = 0
+  const workerCount = Math.max(1, Math.min(8, normalizedRepositories.length))
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < normalizedRepositories.length) {
+      const index = nextIndex
+      nextIndex += 1
+      const normalized = normalizedRepositories[index]
+      const manifest = await detectRepositoryManifest({
+        fetchFn: input.fetchFn,
+        ownerAndRepo: normalized.fullName,
+        token,
+      })
+
+      repositories[index] = {
+        ...normalized,
+        hasPluginManifest: manifest.manifestKind !== null,
+        manifestKind: manifest.manifestKind,
+        marketplacePluginCount: manifest.marketplacePluginCount,
+      }
+    }
+  })
+  await Promise.all(workers)
 
   return repositories
 }
@@ -465,7 +534,7 @@ export async function getGithubRepositoryTextFile(input: {
     throw new GithubConnectorRequestError("GitHub repository full name is invalid.", 400)
   }
 
-  const token = input.token ?? await createGithubInstallationAccessToken(input)
+  const token = input.token ?? await getGithubInstallationAccessToken(input)
   const response = await requestGithubJson<{ content?: string; encoding?: string }>({
     allowStatuses: [404],
     fetchFn: input.fetchFn,
@@ -547,7 +616,7 @@ export async function getGithubRepositoryHeadSha(input: {
     throw new GithubConnectorRequestError("GitHub repository full name is invalid.", 400)
   }
 
-  const token = input.token ?? await createGithubInstallationAccessToken(input)
+  const token = input.token ?? await getGithubInstallationAccessToken(input)
   const commitResponse = await requestGithubJson<{ sha?: string }>({
     fetchFn: input.fetchFn,
     headers: {
@@ -576,7 +645,7 @@ export async function getGithubRepositoryTree(input: {
     throw new GithubConnectorRequestError("GitHub repository full name is invalid.", 400)
   }
 
-  const token = input.token ?? await createGithubInstallationAccessToken(input)
+  const token = input.token ?? await getGithubInstallationAccessToken(input)
   const authHeaders = {
     Authorization: `Bearer ${token}`,
   }
@@ -658,7 +727,7 @@ export async function validateGithubInstallationTarget(input: {
     }
   }
 
-  const token = input.token ?? await createGithubInstallationAccessToken(input)
+  const token = input.token ?? await getGithubInstallationAccessToken(input)
   const authHeaders = {
     Authorization: `Bearer ${token}`,
   }

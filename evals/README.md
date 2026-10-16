@@ -1,321 +1,407 @@
-# OpenWork UI evals
+# OpenWork tests and test evidence
 
-Human-readable scenarios and coded flows that verify end-to-end OpenWork UI
-behavior against a live app.
+All executable coverage lives in [`specs/**/*.test.ts`](./specs) and imports
+`test` from `@openwork/testkit`. Tests that drive Electron, Den, or another app
+surface use `.e2e.test.ts`.
 
-Each eval should have:
-- A short narrative spec written in plain English.
-- An **expected outcome** with observable signals.
-- A coded flow under [`flows/`](./flows) when it is used for PR evidence or
-  repeated regression coverage.
+## Paved path
 
-They are not unit tests. They intentionally exercise the running stack
-(OpenCode + OpenWork server + React UI) so regressions in wiring — not just
-types — get caught.
+Use the skills in this order:
 
-## Coded flows (programmatic runner)
+1. `write-a-spec`
+2. `run-tests`
+3. `diagnose-a-red-run` when the run fails
+4. `publish-evidence` for the existing ambient test evidence
 
-A growing subset of flows is codified under [`flows/`](./flows) and executed by
-the zero-dependency runner in [`runner/`](./runner) with machine-checkable
-assertions, poll-until-condition waits (no fixed sleeps), and JSON + markdown
-reports with screenshots. The runner also writes a browseable frame-by-frame
-`index.html` in each result directory. New flows should be typed
-`*.flow.ts` files using `defineFlow` from `../runner/flow.ts`; legacy
-`*.flow.mjs` files are still supported.
+Demo-driven features start from a preset or world plus a spec in `evals/specs`.
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| world | A declarative environment and the resources started from it. |
+| topology | The `WorldTopology` shape: Den organizations, environment, web, substrate, ports, and seed, plus apps and witnesses. |
+| preset | Code: a typed, composable, reviewed world definition. |
+| snapshot | A generated receipt of one run. It is data and untrusted input. |
+| place | Where launched resources run: `local` or `daytona`. |
+| substrate | What runs the Den control plane: local processes or `kind`. |
+| witness | A deterministic provider stand-in that records what it saw. |
+| fault | Declared misbehavior used to reproduce a failure condition. |
+| surface | A drivable UI: Electron, or Chrome on Den Web. |
+| origin | Whether a resource is launched or attached. See below. |
+| live | A spec attached to a live shared substrate; red is an incident signal about the service, not a verdict on the diff. |
+
+### Origin: launch vs attach
+
+Every world resource has an origin. *Launched* resources are created by the
+world, owned by it, and disposed with it; plain nouns in a topology mean
+launched. *Attached* resources pre-exist the world; the world binds to them and
+never creates or destroys them. The law: **you own what you launch; you never
+own what you attach.** Dispose, cleanup, and `world rebuild` follow from it:
+rebuild relaunches launched resources and reattaches attached ones.
+
+The term is `attach`, not `connect` (`connections` already names org-to-provider
+bindings in topology), and not `reuse` or `prepared` (legacy names in
+`@openwork/env` internals that will migrate to attach).
+
+## Skills map
+
+Skills own mechanics; this README owns the map and vocabulary.
+
+| Task | Skill to load | When |
+| --- | --- | --- |
+| Author a spec | `write-a-spec` | Add executable coverage under `evals/specs`. |
+| Run tests | `run-tests` | Run a selected testkit spec locally or on Daytona. |
+| Failing or red run | `diagnose-a-red-run` | Classify a failure before changing code. |
+| Publish evidence | `publish-evidence` | Publish an existing ambient evidence run. |
+| Declare a PR verdict | `prove-a-pr` | Decide Passed, Incomplete, or Failed from assertions. |
+| Missing secret or environment variable | `get-env-var` | Load a required team secret into the shell. |
+| Drive local Electron via CDP | `browser-automation` | Explore or debug the local desktop surface. |
+| Daytona E2E | `daytona-electron-test` | Launch and drive Electron in Daytona. |
+| Daytona server or Den setup | `daytona-cloud-server` | Prepare the server-side Daytona sandbox. |
+| Provider keys in Daytona | `daytona-secrets-volume` | Use provider credentials from the Daytona secrets volume. |
+
+## Install and run
+
+`evals/` is a standalone pnpm workspace so its tooling cannot affect product
+installs or image builds.
 
 ```bash
-pnpm evals --list                 # automation mode: show available coded flows
-pnpm evals --all                  # automation mode: no narration policy
-pnpm evals --flow app-smoke       # automation mode: run one flow
-pnpm evals:typecheck              # typecheck *.flow.ts + runner TypeScript
-pnpm evals --all --cdp-url http://127.0.0.1:9825   # explicit CDP endpoint
+pnpm --dir evals install
+pnpm evals:pr
+pnpm evals:e2e app-smoke
 ```
 
-`pnpm evals` is automation mode: it never enforces voice-over coverage and
-unnarrated frames render without a warning. `pnpm fraimz` is demo mode: it keeps
-the voice-over drift check and narrated-frame warnings described below.
+### E2E CLI
 
-## Composable packages + spec lane
+Run the E2E lane with `pnpm evals:e2e [test-names...]`. Naming a test
+auto-satisfies the opt-in flags declared in its source, but value-bearing
+environment variables such as `OPENWORK_EVAL_MODEL` are never auto-set. Vision
+judging is deferred by default; add `--with-llm-vision` to judge inline. Use
+`--local` to force isolated local resources, `--daytona` for Daytona resources,
+`--den <url>` to reuse Den, or `--publish --pr <number>` to judge and publish
+existing evidence. Without a placement flag, the CLI preserves the ambient
+placement environment.
 
-`evals/` is its own **standalone pnpm workspace** (`evals/pnpm-workspace.yaml`)
-so eval tooling can never affect product installs or image builds. Install it
-separately:
+| Exit | Named test | Unfiltered E2E suite | Publish |
+| --- | --- | --- | --- |
+| `0` | Passed | Passed, or incomplete with expected skips | Published |
+| `1` | Failed | Failed | Failed claims published, or publish failed |
+| `2` | Incomplete because it skipped | Not used | Claims pending judgment |
+
+See `run-tests` for environment requirements and the cold-boot verdict check.
+
+### Live lane
+
+Surface and substrate are independent axes:
+
+| Surface | Launched substrate (world-owned, hermetic) | Attached live substrate |
+| --- | --- | --- |
+| App-less | `<slug>.test.ts` | `<slug>.live.test.ts` |
+| App-driving | `<slug>.e2e.test.ts` | Not yet paved |
+
+Run a live spec only by exact name and with explicit consent and endpoint values:
 
 ```bash
-pnpm --dir evals install           # required once (and in CI) before the commands below
-pnpm --dir evals run test          # node:test unit tests (runner + packages)
-pnpm --dir evals run spec          # vitest spec lane, pr project
-pnpm --dir evals run spec:nightly  # includes *.slow.test.ts
+OPENWORK_EVAL_LIVE=1 OPENWORK_EVAL_LIVE_DEN_API_URL=https://api.openworklabs.com OPENWORK_EVAL_SECRET_LIVE_MAILBOX_EMAIL=<mailbox> pnpm evals:pr specs/prod-den-signup-invites.live.test.ts
 ```
 
-The layers live in [`packages/`](./packages) and are consumable independently of
-the runner:
+The live Den is attached and never deleted. Timestamped plus-addressed identities,
+organizations, and invitations launched onto it are owned by the spec; cleanup is
+asserted even on failure, and any residue (including an account without a
+self-service deletion endpoint) must be documented with exact identities.
+
+## Authoring contract
+
+- Import `test` from `@openwork/testkit`.
+- Name app-driving files `<slug>.e2e.test.ts`; app-less tests use `<slug>.test.ts`.
+- Live specs use `<slug>.live.test.ts`, never run in PR/E2E suites, and require a consent environment variable.
+- Acquire resources in dependency order with `needs()` → `server()` → `app()`.
+- Drive user-visible behavior and assert observable outcomes. Backend, file,
+  and process checks may witness side effects but do not replace the journey.
+- Bound every wait and declare external requirements in `needs()` so missing
+  dependencies skip with a named reason.
+- Assert both positive and negative sides of identity or permission boundaries.
+
+## Layers
+
+Imports only point down: a layer may use lower layers, never a higher layer.
+This is enforced by `pnpm --dir evals run lint:layers`.
+
+| Layer | Contents | Rule |
+| --- | --- | --- |
+| L0 | `@openwork/matchers` | Turn supplied facts into pure findings; no I/O. |
+| L1 | `@openwork/cdp`, `@openwork/labs` | Provide protocol and lab primitives; do not own journeys or test lifecycle. |
+| L2 | `@openwork/behaviors` | Provide framework-free actions and observations over narrow handles. |
+| L3 | root `@openwork/world` + `@openwork/env` | The shared package owns definitions/CLI/state/surfaces; env injects the eval-only Den/desktop runtime adapter. Neither depends on Vitest. |
+| L4 | `@openwork/testkit` and `evals/bin/evals.mjs` | Adapt environments to specs, Vitest, and evidence. |
+
+## Composable packages and diagnostics
+
+The packages under [`packages/`](./packages) are independently consumable, but
+executable coverage is always assembled as a test under `specs/`.
 
 | Package | Owns |
 | --- | --- |
-| `@openwork/cdp` | raw CDP client, targets, `Surface`, `attachSurface` |
-| `@openwork/labs` | egress / idp / release-feed / mock-mcp — `start*(config) → handle` with `stop()` + `Symbol.asyncDispose` |
-| `@openwork/hosts` | local + daytona hosts, `resolveHost()` |
-| `@openwork/behaviors` | framework-free actions/observations over narrow handles; return facts, never record evidence |
-| `@openwork/matchers` | pure functions over facts (`diagnoseTls`, …) — testable with fabricated facts, no I/O |
-| `@openwork/fraimz` | frame capture + annotation channel |
+| root `@openwork/world` | generic definitions, path discovery, CLI lifecycle, local state store, and headless-web surface |
+| `@openwork/env` | eval runtime adapter: places, Den server, desktop apps, mocks, eval snapshots, and kind stack |
+| `@openwork/testkit` | thin Vitest adapter: fixture, needs/skip mapping, evidence bridging, and spec-facing re-exports |
+| `@openwork/cdp` | raw CDP client, targets, `Surface`, and `attachSurface` |
+| `@openwork/labs` | egress, identity-provider, release-feed, and mock-MCP labs |
+| `@openwork/hosts` | local and Daytona hosts and `resolveHost()` |
+| `@openwork/behaviors` | framework-free actions and observations over narrow handles |
+| `@openwork/matchers` | pure findings over facts, with no I/O |
+| `@openwork/test-evidence` | screenshot capture, visual validation, and ambient test-evidence recording used by testkit |
+| `@openwork/timeline` | timing spans for long test journeys |
+| `@openwork/test-artifacts` | index, render, and PR publication for completed test runs |
 
-Specs in [`specs/`](./specs) are plain vitest tests: acquire resources with
-`await using`, drive them with behaviors, assert with matchers. Because behaviors
-take handles rather than a framework context, the same calls run outside any test
-— see [`scripts/diagnose.mts`](./scripts/diagnose.mts), which imports only
-`@openwork/behaviors` + `@openwork/matchers` and points them at a real endpoint:
+Because behaviors and matchers do not depend on a test context, they also power
+the standalone diagnostic script at `evals/scripts/diagnose.mts`. It imports
+only `@openwork/behaviors` and `@openwork/matchers` and can inspect a real
+endpoint without creating test evidence.
 
-```bash
-node evals/scripts/diagnose.mts https://den.customer.example
-```
+## Worlds
 
-### fraimz — the deliverable
+A world is a declarative topology managed by root `@openwork/world`.
+`@openwork/env` keeps the eval-only topology schema and injects its Den/desktop
+runtime adapter into the shared shell.
+`defineWorld()` validates a `WorldTopology` and returns a definition that can be
+deep-patched with `.with()`. The topology has:
 
-Every run writes **`fraimz.html`** to `evals/results/<run-id>/`: the
-frame-by-frame proof where each frame binds a **claim**, the **action** the end
-user took, the **assertion** that witnesses the side effect, and a validated
-**screenshot**. fraimz is the atomic artifact a human looks at to understand the
-experience at a glance — it is what we review, and we can fine-tune what each
-frame captures over time. (`index.html` is kept as a back-compat alias.)
+- `den.orgs`: named organizations, each with an optional admin and named members.
+- `den.env`: optional environment variables for the Den server. `den.web` and
+  `den.substrate` also configure that server; `den.ports` fixes API and Web
+  ports, and `den.seed` selects the supported demo seed.
+- `apps`: optional named desktop apps with their target org/member, workspace,
+  model, sessions, and optional local server delay.
+- `witnesses`: optional named witnesses; v1 accepts MCP mocks only.
 
-"Make fraimz for this flow" runs the whole loop — create/pick the eval, drive
-it as the end user, validate and repair, output `fraimz.html`. Trigger it with
-the `/fraimz` command or:
+The shipped definitions are `soloWorkspace`, `supportOrg`, `acmeDemo`,
+`acmeDocs`, and `desktopProductionLive`; their CLI names are `solo`,
+`support-org`, `acme-demo`, `acme-docs`, and `desktop-prod-live`. `startWorld()` boots the Den, organizations, witnesses, and apps in
+dependency order and disposes them together. `fromSnapshot()` validates
+generated snapshot JSON and returns the name and topology needed to start an
+equivalent fresh world.
 
-```bash
-pnpm fraimz --flow <id>           # same runner; headline output is fraimz.html
-pnpm fraimz --flow core-flow --cdp-url http://127.0.0.1:9825
-```
+Each started world writes a snapshot to
+`evals/results/.worlds/<name>.json`. Snapshots contain the validated topology
+plus resolved Den and app endpoints. They are generated, never hand-written.
+Snapshots are untrusted input: `rebuild` and `resume` allowlist Den environment
+keys, database names, ports, paths, models and faults, and require loopback-only
+resolved CDP URLs before starting, attaching to, or tearing down resources.
 
-### Voice-over first: the script is the spec
+### World CLI
 
-Demo-driven development starts with the narration, not a PRD. The `/voiceover`
-command (and `voiceover` skill) aligns on the demo script with the user before
-any code; the approved script lands at `evals/voiceovers/<flow-id>.md` — a
-title, optional context prose, and one **numbered paragraph per frame**.
-On approval the build moves to a fresh worktree/branch; the journey ends with the PR carrying the proof (see the `voiceover` skill).
-
-```bash
-pnpm fraimz scaffold <flow-id>    # generate evals/flows/<flow-id>.flow.ts
-                                  # from the approved script: one ctx.prove
-                                  # stub per paragraph, narration pre-wired
-pnpm fraimz --flow <flow-id> --pr # after the run, post the frame proof as a
-                                  # PR comment via gh (--pr <number> to target)
-```
-
-`--pr` uploads each frame screenshot to Vercel Blob so it renders inline in
-the comment (see the `upload-photo` skill); this requires
-`BLOB_READ_WRITE_TOKEN` in the environment (`get-env-var` skill /
-`infisical secrets get BLOB_READ_WRITE_TOKEN --plain --silent`). The comment
-renders each frame as claim → voiceover → assertions → screenshot so reviewers
-can follow the demo step by step. If the token is missing or an upload fails,
-the comment still posts with a note and the screenshots stay available in
-`evals/results/<run-id>/`.
-
-Flows load their narration with `loadVoiceoverParagraphs(<flow-id>)`; in demo
-mode, when a script exists for a flow, the runner appends a **Voice-over script
-coverage** step that fails the flow if the run's narration drifts from the
-approved file (a scripted frame never narrated, or an unapproved line narrated).
-`pnpm evals scaffold <flow-id>` in automation mode emits the same narrated stub
-when a script exists; without a script it emits a plain typed stub instead.
-`pnpm fraimz scaffold <flow-id>` still requires the approved script.
-
-Internal demos of terminal/tooling experiences can set `requiresApp: false` to
-run without a CDP endpoint; their frames carry claims, assertions, and
-`ctx.output(name, text)` command output instead of screenshots. The reference
-is `voiceover-first-dx` — this workflow demoing itself.
-
-The runner probes `http://127.0.0.1:9825` (Daytona) then `:9823` (local
-`pnpm dev`) by default. Flows that need cloud credentials declare
-`requiredEnv` and are skipped (not failed) when the env is missing — e.g.
-`cloud-signin-handoff` needs `OPENWORK_EVAL_DEN_API_URL` and
-`OPENWORK_EVAL_DEN_TOKEN`. Reports land in `evals/results/<run-id>/`
-(gitignored). Open `evals/results/<run-id>/index.html` for the frame proof.
-A non-zero exit code means at least one flow failed.
-
-### One-command cloud stack
+The root `pnpm world` command requires Node 24+. Its interactive lifecycle is:
 
 ```bash
-pnpm evals --all --stack den     # MySQL + schema + den-api + demo seed +
-                                 # desktop bootstrap + dev app, then runs flows
-pnpm evals --stack-down          # stop what --stack den started
+pnpm world up support-org          # boot a world; stays up until Ctrl-C
+pnpm world up acme-demo --name acme-demo --keep
+                                    # keep resources after exit
+pnpm world resume acme-demo        # attach to that running world
+pnpm world resume acme-demo --teardown
+                                    # attach and stop it
+pnpm world rebuild <snapshot>      # rebuild the world a failed run was in
+pnpm world list
+pnpm world forget <name>
+
+# Path definitions use the filename as their name and can default to detached.
+pnpm world up ./worlds/dev-headless.ts
+pnpm world up ./worlds/headless-prod-live.ts --allow-shared-state
+
+# Explicit macOS-only live sharing with the installed production stores.
+pnpm world up ./worlds/desktop-prod-live.ts --allow-shared-state
 ```
 
-`--stack den` is idempotent: each layer (MySQL, schema, den-api, seed, app)
-is skipped when already up. It signs in as the seeded demo owner
-(`alex@acme.test`) and exports `OPENWORK_EVAL_DEN_API_URL` /
-`OPENWORK_EVAL_DEN_TOKEN`, so the env-gated cloud flows run with zero manual
-setup. Requires Docker. The MySQL volume survives `--stack-down`, so
-subsequent runs skip schema push and seeding.
+`up` also accepts `--name <name>`. Without `--keep`, Ctrl-C tears down the
+resources; with `--keep`, Ctrl-C leaves them detached. `resume` accepts a world
+name or snapshot path and detaches on Ctrl-C unless `--teardown` is present.
+`forget` removes snapshot metadata without stopping detached services. `help`
+and `list` auto-discover `worlds/*.ts`. Path definitions may select detached mode,
+so the checked-in headless and production-live definitions return after health
+without requiring `--name`, `--keep`, or `--detach`.
 
-The markdown specs below remain the source narrative; when codifying a flow,
-link the spec via the flow's `spec` field.
+`desktop-prod-live` is a deliberately dangerous local-only mode. It launches
+source Electron through `pnpm dev` with isolated Electron userData, app
+identifier, Vite/CDP ports, and protocol registration, while resolving the
+installed production `OPENWORK_DATA_DIR` and channel-aware `OPENCODE_DB` only at
+launch time. It never copies or symlinks those stores, does not boot or modify a
+Den, and does not seed a workspace, session, or sign-in. Production may remain
+running, but concurrent writes from production and dev are unsupported and may
+corrupt state. `up` and every `rebuild` require `--allow-shared-state`; `resume`
+only attaches to the already-running isolated dev process. Snapshots retain the
+symbolic `desktopState` source/mode plus CDP/workspace metadata, never resolved
+production paths or tokens. Teardown stops only the dev process and does not
+delete shared stores.
 
-## How to run
+`headless-prod-live` applies the same symbolic state selection to source Vite +
+`openwork-server` without Electron. Its production tokens, server state, config,
+OpenWork data, and OpenCode database are resolved in place and never copied into
+the owner-only world snapshot. It refuses remote access, public hosts, and
+non-loopback host bindings. Named headless worlds use separate runtime/config/log
+directories and a launch identity, and their detached supervisor tears down the
+remaining sibling if Vite or the backend exits.
 
-### Option A: On Daytona (recommended)
+World v1 has deliberate limits:
 
-Run against a real Electron app in a Daytona cloud sandbox. No local Docker or
-display needed. See [`daytona-flows.md`](./daytona-flows.md) for full details.
+- Apps may sign in only to the first (primary) organization; an app without
+  `signedInTo` remains fresh and signed out.
+- Witnesses are MCP mocks only.
+- `onKind()` runs a real Helm Den on the shared `openwork-kube-lab` kind cluster.
+  Kind worlds can boot local Electron apps signed in as the seeded Acme admin;
+  they do not yet accept witnesses, extra organizations, seed overrides, custom
+  port-forwards, or non-local placement.
 
-Quick start:
+Run the opt-in proof on a machine with local Docker, kind, kubectl, and Helm:
 
 ```bash
-daytona organization use "<org-name>"
-bash .devcontainer/test-on-daytona.sh [branch-or-commit] --artifacts-volume
-pnpm evals --flow app-smoke --cdp-url <printed-electron-cdp-url>
+OPENWORK_EVAL_E2E_TESTS=1 OPENWORK_EVAL_KIND_E2E=1 pnpm --dir evals exec vitest run --config vitest.config.ts --project e2e specs/world-kind-den.e2e.test.ts
 ```
 
-### Option B: Local Electron
+Daytona cannot host this substrate: its sandbox has no Docker binary or daemon,
+reports `CapEff: 0000000000000000`, and blocks `unshare -Urm`, so no container
+runtime can start kind there.
 
-Start the Electron dev app locally:
+### Reproducing a failure
+
+A failed local run's world snapshot can be rebuilt with:
 
 ```bash
-pnpm dev
+pnpm world rebuild evals/results/.worlds/<name>.json
 ```
 
-Wait ~15s, then use the browser tools against `http://127.0.0.1:9825`.
+## Recipes
 
-### Option C: Manual browser/debugging
+### Drive the app
 
-Open the app and follow the step lists by hand. Use this for exploration or
-debugging only; PR evidence for UI changes should use a coded flow when
-possible.
+Use `startWorld()` and select named surfaces with `world.app("name")`. Compose
+journeys from `@openwork/behaviors`; executable coverage belongs in `evals/specs`.
 
-## Tool reference
+```ts
+import { startWorld, supportOrg } from "@openwork/testkit";
 
-Evals use the CDP browser tools provided by the `opencode-chrome-devtools`
-plugin (configured in `.opencode/opencode.json`). Every tool takes
-`browser_url` as the first argument.
+await using world = await startWorld(supportOrg, { place });
+const alice = world.app("alice"); // signed in
+const bob = world.app("bob"); // fresh, not signed in
+```
 
-| Tool | Description |
-|------|-------------|
-| `browser_list` | List page targets on the CDP endpoint |
-| `browser_navigate` | Navigate a target to a URL |
-| `browser_snapshot` | Accessibility tree with UIDs |
-| `browser_click` | Click by snapshot UID |
-| `browser_fill` | Fill input by snapshot UID |
-| `browser_eval` | Run JS in the page |
-| `browser_screenshot` | Capture PNG |
+### Provision a fresh setup
 
-## Conventions
+Create a topology with `defineWorld()` or patch a preset with `.with()`. Use
+`pnpm world up <preset>` interactively and `startWorld()` in specs.
 
-- Prefer coded flows in `evals/flows/*.flow.ts` using `defineFlow` over ad hoc
-  browser tool calls; legacy `*.flow.mjs` files remain runnable.
-- Declare the demo kind on every new flow: `kind: "user-facing"` (a flow demo
-  where the end user is the protagonist) or `kind: "internal"` (an internal
-  demo, e.g. perf improvements or invariants). The runner rejects other values
-  and flags legacy flows without one in `fraimz.html`.
-- Use runner helpers such as `ctx.clickText`, `ctx.fill`, `ctx.waitFor`,
-  `ctx.expectText`, `ctx.expectNoText`, `ctx.expectHashIncludes`,
-  `ctx.control`, `ctx.prove`, and validated `ctx.screenshot` calls.
-- Prefer `ctx.prove("claim", { voiceover, action, assert, screenshot })` for PR
-  evidence. It records the claim, voiceover, assertions, screenshot, and
-  validation results together so the HTML frame proof explains why each image
-  proves the step.
-- In demo mode, every `ctx.prove` should carry a `voiceover`: one or two spoken-style
-  sentences narrating what the viewer sees in that frame. `fraimz.html` renders
-  it per frame with a play button (Web Speech API) and a per-flow "Play full
-  voiceover". Write the voiceover script for the whole demo before coding the
-  flow. See `evals/flows/session-search-grouped.flow.mjs` for the reference
-  shape.
-- Screenshots should include `claim`, `requireText`, `rejectText`, or
-  `hashIncludes` whenever possible. A screenshot without an assertion is only a
-  visual checkpoint, not proof that the workflow passed.
-- Pretty screenshots are available with `pretty: true` (or
-  `pretty: { padding, radius }`) on the existing screenshot primitive. The
-  default padding is `0.06` of the longer raw capture edge, rounded corners
-  default to `18px`, and the runner adds validations for the mesh-gradient
-  background corners, rounded clipping, drop shadow, and unchanged app-content
-  center pixel. Use this for PR hero frames, newsletters, and docs; the evidence
-  semantics stay the same, and duplicate detection still compares the raw app
-  capture.
-- Use direct `browser_eval` only for debugging/prototyping or when a flow has
-  not yet been codified. If the behavior matters for a PR, codify it before
-  calling the UI validation complete.
-- For Lexical editors in coded flows, use a synthetic paste/event helper; direct
-  DOM manipulation doesn't trigger Lexical state updates.
-- For React state injection (e.g., folder picker bypass), use the
-  `__reactFiber$` → reducer dispatch pattern documented in `daytona-flows.md`.
-- Prefer poll-until-condition waits (`ctx.waitFor`, `ctx.waitForText`) over
-  fixed sleeps.
-- The runner forces **light mode** by default before every flow runs
-  (`ctx.ensureLightMode()`, called automatically in `runner/run.mjs`) so
-  screenshot evidence stays readable regardless of the host machine's OS theme.
-  A flow that is itself testing theme/dark-mode behavior can opt out with
-  `preserveTheme: true` on the flow definition; no current flow needs this.
+```ts
+const slowSupport = supportOrg.with({ apps: { bob: { localServerDelayMs: 500 } } });
+```
 
-## Evidence and repair standard
+### Reproduce network conditions
 
-Frame proof is the default for UI evals. The generated `index.html` should show
-each step, the claim being proven, assertions, screenshot validation checks, and
-supporting images. Treat recordings as supplementary evidence for motion, not as
-the primary pass/fail source.
+Declare provider faults at `witnesses.<name>.fault` in the topology; fault proxy
+controls live in `faults.ts`. Use `localServerDelayMs` on apps for delayed local
+server startup.
 
-Before reporting a flow as passed:
-- Confirm every important user-visible claim has an assertion.
-- Confirm every important screenshot has validation metadata and is not just a
-  loose gallery image.
-- Re-capture or repair evidence if the screenshot is duplicated, missing required
-  text, showing an error state, or taken on the wrong route.
-- For Daytona display screenshots, also verify no native picker, modal, stale
-  dialog, or unrelated desktop window is covering the claimed state.
-- If the test used API/localStorage/setup shortcuts, label that evidence as setup
-  and resume visible proof at the next user-facing step.
+```ts
+const faulted = acmeDocs.with({
+  witnesses: { slack: { profileId: "slack-user-mcp", fault: "provider-throttled" } },
+});
+```
 
-## Files
+### Reproduce a failure
 
-- [`daytona-flows.md`](./daytona-flows.md) — Daytona sandbox flows (workspace
-  creation, session messaging, screenshot verification).
-- [`react-session-flows.md`](./react-session-flows.md) — core
-  session/settings flows verified during the React port cutover, including
-  long streaming interruption coverage.
-- [`openable-items-flow.md`](./openable-items-flow.md) — inline openable-item
-  chips, Cmd/Ctrl+K inventory, artifact/browser opening, icon checks, and
-  screenshot evidence requirements.
-- [`reload-events-flow.md`](./reload-events-flow.md) — reload-required toast
-  suppression on boot/no-op writes and positive coverage for real runtime config
-  changes.
-- [`onboarding-welcome-flows.md`](./onboarding-welcome-flows.md) — the 7
-  onboarding/welcome flows covering first-run experience and folder
-  explanation.
-- [`browser-extension-flows.md`](./browser-extension-flows.md) — browser
-  extension plugin loading, built-in browser navigation, composer extensions
-  menu, extension toggle, and stale MCP migration.
-- [`extensions-marketplace-flows.md`](./extensions-marketplace-flows.md) —
-  extension runtime and marketplace install/remove/search/filter flows.
-- [`desktop-policy-extension-flows.md`](./desktop-policy-extension-flows.md) —
-  admin-to-member extension policy flows for disabling and restoring built-in
-  extensions.
-- [`cloud-admin-to-member-assignment-flows.md`](./cloud-admin-to-member-assignment-flows.md)
-  — admin assigns providers/policies to a member, member desktop receives and
-  uses them, then removal restores/cleans up UI state.
-- [`cloud-signin-client-provisioning-funnel.md`](./cloud-signin-client-provisioning-funnel.md)
-  — founder funnel from website sign-in to provisioning skills/plugins/providers
-  and validating the capability appears and produces value in the desktop client.
-- [`workspace-layout-state-flows.md`](./workspace-layout-state-flows.md) —
-  persisted sidebar/browser layout, legacy layout migration, and workspace-safe
-  layout state.
-- [`environment-variable-flows.md`](./environment-variable-flows.md) — local
-  environment variable CRUD, masking, validation, apply/restart behavior, and
-  remote-workspace secret boundaries.
-- [`cloud-auth-flows.md`](./cloud-auth-flows.md) — desktop cloud sign-in
-  (browser handoff + paste-code), expired grants, sign-out cleanup, and org
-  switching.
-- [`cloud-mcp-agent-flows.md`](./cloud-mcp-agent-flows.md) — agent-driven org
-  management through the openwork-cloud MCP: org identity, invitations, team
-  assignment, and skill sharing via plugins + marketplaces, with server-side
-  ground-truth assertions.
-- [`cloud-provider-sync-flows.md`](./cloud-provider-sync-flows.md) — org LLM
-  provider import, update, delete, refresh timing, and permission boundaries.
-- [`cloud-marketplace-sync-flows.md`](./cloud-marketplace-sync-flows.md) —
-  marketplace plugin import/update/removal sync between Den and the desktop.
-- [`cloud-org-membership-flows.md`](./cloud-org-membership-flows.md) — org
-  invitations, role updates, member removal, and domain restrictions.
-- [`daytona-server-failure-recovery-flows.md`](./daytona-server-failure-recovery-flows.md)
-  — Den API/Web/proxy/MySQL outage and recovery behavior.
-- [`default-openwork-marketplace-onboarding-flow.md`](./default-openwork-marketplace-onboarding-flow.md)
-  — default Marketplace provisioning funnel from sign-in to chat handoff.
-- [`den-marketplace-guided-onboarding-flow.md`](./den-marketplace-guided-onboarding-flow.md)
-  — guided browser + desktop marketplace onboarding with pass criteria.
+Take the snapshot from the failed run and rebuild its topology in a fresh world:
+
+```bash
+pnpm world rebuild evals/results/.worlds/<name>.json
+```
+
+### Docs screenshots and demos
+
+The same `startWorld()` lifecycle powers docs shots and demos, so docs, CI, and
+reproduction cannot diverge. Use the `acmeDocs` and `acmeDemo` presets.
+
+## Ambient evidence and verdicts
+
+The testkit fixture opens and closes a test-evidence recorder around each test.
+Screenshots become test artifacts, visual validation records their expectations,
+and assertion evidence carries witness assertions. Do not create or pass
+recorder handles.
+
+Report `Passed` only when every claim has observable evidence in the test run.
+A failed assertion is `Failed`; missing requirements, tooling failure, or
+missing test evidence is `Incomplete` or a named skip. A green suite containing
+skips is not proof.
+
+Publish an already completed test run with the `publish-evidence` skill:
+
+```bash
+pnpm evals:e2e --publish --pr <number> [--test-run <path|directory-id|latest|name>]
+```
+
+`evals:e2e --publish` judges and publishes test evidence without rerunning tests.
+Its optional `--test-run` argument selects an existing test run by path,
+directory ID, record name, or `latest` at publish time. Custom screenshots and
+recordings are supplementary and never determine the pass/fail verdict.
+
+## Standalone isolated Den
+
+For an isolated Den API without Electron or Den Web, use the development helper:
+
+```bash
+pnpm --dir evals dev:den -- up --port 8891 --database openwork_den_my_eval --seed
+pnpm --dir evals dev:den -- down --port 8891 --drop-database
+```
+
+The port and database are generated when omitted. The helper starts MySQL,
+pushes the current schema, and prints the eval URL exports and teardown command.
+It also adds the printed `OPENWORK_EVAL_DEN_WEB_URL` to the trusted origins;
+without that origin, Better Auth rejects eval sign-in with
+`403 INVALID_ORIGIN`.
+
+## Daytona E2E tests
+
+Use the maintained Daytona setup from `run-tests`, then run a selected test
+through the E2E CLI:
+
+```bash
+pnpm evals:e2e app-smoke --daytona
+```
+
+Use direct CDP tools only to explore or debug. Convert repeatable coverage into
+a testkit test.
+
+## CDP manual-debugging tools
+
+The `opencode-chrome-devtools` plugin exposes these browser tools. Every call
+takes `browser_url`; target-specific calls also use the selected target ID.
+
+| Tool | Purpose |
+| --- | --- |
+| `browser_list` | list page targets on a CDP endpoint |
+| `browser_navigate` | navigate a target |
+| `browser_snapshot` | inspect the accessibility tree and stable UIDs |
+| `browser_click` | click a snapshot UID |
+| `browser_fill` | fill an input by UID |
+| `browser_eval` | inspect state or run debugging JavaScript |
+| `browser_screenshot` | capture a PNG checkpoint |
+
+Use these calls for exploration and debugging, not as replacement verdict
+evidence. Repeatable executable coverage belongs in a testkit test, where
+observable assertions and validated screenshots are recorded as test evidence.
+
+## Reserved names (not implemented)
+
+These names are designed but not built. Do not attempt to use them:
+
+- `attach.den({ url, tier })`
+- `attach.user({ secretRef })`
+- `attach.sandbox(...)`
+- `tier: "prod" | "staging" | "demo"`; the production tier will structurally
+  refuse organization provisioning, seeding, and database access.
+- `secretRef`; secrets will be named and resolved at start. Snapshots may carry
+  secret references, never secret values.
+
+The low-level escape hatch available today is
+`OPENWORK_EVAL_DEN_API_URL` with `OPENWORK_EVAL_DEN_WEB_URL`. It attaches an
+existing Den at the `server()` level and is called `reuse` in current code.
+Attached mode has no `apiLog()` and does not support `seedProfile`. Locally
+launched mocks are loopback-only and therefore unreachable from a remote Den.

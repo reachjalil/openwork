@@ -1,6 +1,7 @@
 import type { FilePartInput, TextPartInput } from "@opencode-ai/sdk/v2/client";
 
 import type { ComposerAttachment } from "../../../../app/types";
+import { compressImageFile } from "./image-compression";
 import { joinWorkspaceRelativePath, toFileUrl } from "./prompt-file-parts";
 
 type AttachmentKind = "image" | "file";
@@ -26,6 +27,13 @@ type InboxUploadResult = {
 
 type ChatAttachmentUploadClient = {
   uploadInbox: (workspaceId: string, file: File, options?: { path?: string }) => Promise<InboxUploadResult>;
+  /**
+   * True when the upload transport streams the original file from disk (for
+   * example the Electron main-process transfer used for remote workspaces).
+   * Re-encoding such a file would strip its local path and corrupt the upload
+   * route, so callers must send it unmodified.
+   */
+  uploadInboxPrefersOriginalFile?: (file: File) => boolean;
 };
 
 export type ChatAttachmentWorkspaceEndpoint = {
@@ -43,6 +51,8 @@ type UploadedChatAttachment = {
 };
 
 const WORKSPACE_INBOX_ROOT = ".opencode/openwork/inbox";
+const MAX_PATH_COMPONENT_BYTES = 255;
+const UTF8_ENCODER = new TextEncoder();
 
 const EXTENSION_MIME_TYPES: Record<string, string> = {
   jpg: "image/jpeg",
@@ -188,11 +198,40 @@ function normalizeFilenameExtension(filename: string, mime: string) {
   return `${stem.trim() || "attachment"}.${preferredExtension}`;
 }
 
-export function safeAttachmentFilename(filename: string) {
+function utf8ByteLength(value: string) {
+  return UTF8_ENCODER.encode(value).byteLength;
+}
+
+function truncateUtf8(value: string, maxBytes: number) {
+  let result = "";
+  let resultBytes = 0;
+  for (const character of value) {
+    const characterBytes = utf8ByteLength(character);
+    if (resultBytes + characterBytes > maxBytes) break;
+    result += character;
+    resultBytes += characterBytes;
+  }
+  return result;
+}
+
+function byteBoundedFilename(filename: string, maxBytes: number) {
+  if (utf8ByteLength(filename) <= maxBytes) return filename;
+
+  const dot = filename.lastIndexOf(".");
+  const extension = dot > 0 && dot < filename.length - 1 ? filename.slice(dot) : "";
+  const extensionBytes = utf8ByteLength(extension);
+  if (!extension || extensionBytes >= maxBytes) return truncateUtf8(filename, maxBytes);
+
+  const stem = filename.slice(0, -extension.length);
+  return `${truncateUtf8(stem, maxBytes - extensionBytes)}${extension}`;
+}
+
+export function safeAttachmentFilename(filename: string, maxBytes = MAX_PATH_COMPONENT_BYTES) {
   const normalized = filename.replace(/\\/g, "/");
   const basename = normalized.split("/").filter(Boolean).pop()?.trim() ?? "";
   const safe = basename.replace(/[\u0000-\u001f\u007f<>:"|?*]/g, "_").trim();
-  return safe && safe !== "." && safe !== ".." ? safe : "attachment";
+  const resolved = safe && safe !== "." && safe !== ".." ? safe : "attachment";
+  return byteBoundedFilename(resolved, maxBytes);
 }
 
 function safePathSegment(value: string, fallback: string) {
@@ -239,8 +278,9 @@ function randomAttachmentId() {
 export function buildChatAttachmentInboxPath(input: { sessionId: string; filename: string; id: string }) {
   const session = safePathSegment(input.sessionId, "session");
   const id = safePathSegment(input.id, "attachment");
-  const filename = safeAttachmentFilename(input.filename);
-  return `chat-attachments/${session}/${id}-${filename}`;
+  const prefix = `${id}-`;
+  const filename = safeAttachmentFilename(input.filename, MAX_PATH_COMPONENT_BYTES - utf8ByteLength(prefix));
+  return `chat-attachments/${session}/${prefix}${filename}`;
 }
 
 export function workspaceInboxPath(inboxRelativePath: string) {
@@ -314,7 +354,15 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
 
   const uploaded: UploadedChatAttachment[] = [];
   for (const attachment of input.attachments) {
-    const metadata = resolveAttachmentFileMetadata(attachment.file);
+    // Oversized images are re-encoded here, at send time, so the composer chip
+    // appears instantly at attach time and the canvas work happens while the
+    // chip already shows its uploading state. When the transport uploads the
+    // original file from its local path, re-encoding would detach that path,
+    // so the original bytes are sent instead.
+    const file = input.endpoint.client.uploadInboxPrefersOriginalFile?.(attachment.file)
+      ? attachment.file
+      : await compressImageFile(attachment.file);
+    const metadata = resolveAttachmentFileMetadata(file);
     const id = input.createId ? input.createId() : randomAttachmentId();
     const inboxPath = buildChatAttachmentInboxPath({
       sessionId: input.sessionId,
@@ -324,7 +372,7 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
 
     let result: InboxUploadResult;
     try {
-      result = await input.endpoint.client.uploadInbox(workspaceId, attachment.file, { path: inboxPath });
+      result = await input.endpoint.client.uploadInbox(workspaceId, file, { path: inboxPath });
     } catch (error) {
       throw new Error(uploadErrorMessage(metadata.filename, error));
     }
@@ -335,8 +383,8 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
     if (!result.path.trim()) {
       throw new Error(`Failed to copy attachment "${metadata.filename}" into this worker workspace: upload did not return a path`);
     }
-    if (result.bytes !== attachment.file.size) {
-      throw new Error(`Failed to copy attachment "${metadata.filename}" into this worker workspace: expected ${attachment.file.size} bytes, wrote ${result.bytes}`);
+    if (result.bytes !== file.size) {
+      throw new Error(`Failed to copy attachment "${metadata.filename}" into this worker workspace: expected ${file.size} bytes, wrote ${result.bytes}`);
     }
 
     const workspacePath = workspaceInboxPath(result.path);
@@ -347,7 +395,7 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
       bytes: result.bytes,
       workspacePath,
       url: toFileUrl(absolutePath),
-      file: attachment.file,
+      file,
     });
   }
 
@@ -358,12 +406,13 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
 }
 
 export async function composerAttachmentToFilePart(attachment: ComposerAttachment): Promise<FilePartInput | null> {
-  const metadata = resolveAttachmentFileMetadata(attachment.file);
+  const file = await compressImageFile(attachment.file);
+  const metadata = resolveAttachmentFileMetadata(file);
   const modelMime = modelFacingAttachmentMime(metadata.mime);
   if (!modelMime) return null;
   return {
     type: "file",
-    url: await fileToDataUrl(attachment.file, modelMime),
+    url: await fileToDataUrl(file, modelMime),
     filename: metadata.filename,
     mime: modelMime,
   };

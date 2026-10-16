@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
 
-import { parseExtensionsPath, parseSettingsPath } from "../src/react-app/shell/settings-route";
 import {
+  extensionsPathForRoute,
+  parseExtensionsPath,
+  parseSettingsPath,
+  settingsDeveloperModePaletteItem,
+  settingsReturnRoute,
+  settingsPathForRoute,
+} from "../src/react-app/shell/settings-route";
+import {
+  getSettingsTabLabel,
   getWorkspaceSettingsTabs,
   isSettingsTabActive,
 } from "../src/react-app/domains/settings/shell/settings-page";
@@ -15,7 +23,6 @@ describe("settings route parsing", () => {
     expect(parseExtensionsPath(pathname)).toEqual(route);
     expect(isSettingsTabActive(route.tab, "extensions")).toBe(true);
     expect(isSettingsTabActive(route.tab, "general")).toBe(false);
-    expect(getWorkspaceSettingsTabs()).toEqual(["preferences", "permissions", "advanced"]);
   });
 
   test("preserves top-level Extensions section and detail deep links", () => {
@@ -50,6 +57,20 @@ describe("settings route parsing", () => {
     expect(parseSettingsPath("/settings/extensions/plugins")).toEqual({ tab: "extensions", redirectPath: null, extensionsSection: "plugins" });
   });
 
+  test("round-trips Library state sections through settings and first-class route writers", () => {
+    const sections: Array<"needs-sign-in" | "needs-admin-setup"> = ["needs-sign-in", "needs-admin-setup"];
+    for (const section of sections) {
+      const settingsRoute = parseSettingsPath(`/settings/extensions/${section}`);
+      expect(settingsRoute).toEqual({ tab: "extensions", redirectPath: null, extensionsSection: section });
+      expect(settingsPathForRoute(settingsRoute)).toBe(`extensions/${section}`);
+      expect(parseSettingsPath(`/settings/${settingsPathForRoute(settingsRoute)}`)).toEqual(settingsRoute);
+
+      const extensionsRoute = parseExtensionsPath(`/extensions/${section}`);
+      expect(extensionsPathForRoute(extensionsRoute)).toBe(section);
+      expect(parseExtensionsPath(`/extensions/${extensionsPathForRoute(extensionsRoute)}`)).toEqual(extensionsRoute);
+    }
+  });
+
   test("redirects the old mcp section to the MCPs filter", () => {
     expect(parseSettingsPath("/settings/extensions/mcp")).toEqual({
       tab: "extensions",
@@ -76,5 +97,50 @@ describe("settings route parsing", () => {
       extensionsSection: "all",
       extensionDetailId: "skill:briefing",
     });
+  });
+});
+
+describe("settings navigation", () => {
+  test("includes Library in workspace settings", () => {
+    expect(getWorkspaceSettingsTabs()).toEqual(["preferences", "permissions", "extensions", "advanced"]);
+    expect(getSettingsTabLabel("extensions")).toBe("Library");
+  });
+
+  test("returns to the originating session in the same workspace", () => {
+    expect(settingsReturnRoute("workspace_1", "workspace_1", "session_1")).toBe(
+      "/workspace/workspace_1/session/session_1",
+    );
+  });
+
+  test("does not carry a session into a different selected workspace", () => {
+    expect(settingsReturnRoute("workspace_2", "workspace_1", "session_1")).toBe(
+      "/workspace/workspace_2/session",
+    );
+  });
+
+  test("returns direct settings visits to the selected workspace root", () => {
+    expect(settingsReturnRoute("workspace_1", null, null)).toBe("/workspace/workspace_1/session");
+    expect(settingsReturnRoute("", null, null)).toBe("/session");
+  });
+
+  test("labels the developer mode palette toggle from its current state", () => {
+    let toggleCount = 0;
+    const enable = settingsDeveloperModePaletteItem(false, () => {
+      toggleCount += 1;
+    });
+    const disable = settingsDeveloperModePaletteItem(true, () => {
+      toggleCount += 1;
+    });
+
+    expect({ title: enable.title, meta: enable.meta }).toEqual({
+      title: "Enable Developer Mode",
+      meta: "Off",
+    });
+    expect({ title: disable.title, meta: disable.meta }).toEqual({
+      title: "Disable Developer Mode",
+      meta: "On",
+    });
+    enable.action();
+    expect(toggleCount).toBe(1);
   });
 });

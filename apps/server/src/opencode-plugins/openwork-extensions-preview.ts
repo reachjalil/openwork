@@ -3,13 +3,14 @@ import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import { z } from "zod";
 import type { OpenworkAffordanceEffects } from "@openwork/types/openwork-affordance";
+import { automationProposalSchema } from "@openwork/types/automations";
 import {
-  combineInstructionSections,
   composeAgentInstructions,
   createInstructionSection,
 } from "./agent-instruction-compose.js";
 import {
   composeSkillAuthoringInstruction,
+  resolveOpenWorkAutomationInstruction,
   resolveOpenWorkConnectSkillInstruction,
   resolveOpenWorkExtensionDiscoveryInstruction,
   type OpenCodeContext,
@@ -140,12 +141,13 @@ Each affordance declares its effects and executor. Use openwork_query only for s
 Reading another session does not require opening it. Prefer session.search then session.read for transcript questions; use session.create for new chats and a UI command only when the user asks to navigate.
 To open settings or navigate the app, use openwork_execute with ids from openwork_context such as settings.panel.open — never browser_* tools for the OpenWork app itself.`;
 
+// The one authoritative statement of the browser rules — the app-surface
+// section already forbids browser_* on the OpenWork app, so this block only
+// adds the external-web mechanics.
 const OPENWORK_BROWSER_INSTRUCTION =
-  `Do NOT use browser_navigate, browser_click, or browser_snapshot to interact with the OpenWork app itself. Those are for browsing external websites.
-
-## Built-in Browser (external websites)
+  `## Built-in Browser (external websites)
 For web browsing tasks, ALWAYS start with openwork_execute id browser.open_url. It creates/selects a built-in OpenWork browser tab and returns browser_url plus target_id. Use that exact browser_url and target_id for every later browser_snapshot, browser_click, browser_fill, browser_eval, and browser_screenshot call.
-Do not call browser_navigate without a target_id returned by browser.open_url. Do not use browser_* tools on the OpenWork app target (avoid targets with title "OpenWork" or URLs containing ":5173/#/").`;
+Do not call browser_navigate without a target_id returned by browser.open_url. Never use browser_* tools on the OpenWork app itself (avoid targets with title "OpenWork" or URLs containing ":5173/#/").`;
 
 // ── UI control bridge discovery ──
 
@@ -188,9 +190,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const MAX_PRESERVED_MCP_APP_RESULT_BYTES = 1024 * 1024;
+
+function preserveMcpResult(output: unknown): void {
+  if (!isRecord(output) || !Array.isArray(output.content)) return;
+
+  const appResult = {
+    content: output.content,
+    ...(output.structuredContent !== undefined ? { structuredContent: output.structuredContent } : {}),
+    ...(isRecord(output._meta) ? { _meta: output._meta } : {}),
+  };
+  try {
+    if (new TextEncoder().encode(JSON.stringify(appResult)).byteLength > MAX_PRESERVED_MCP_APP_RESULT_BYTES) return;
+  } catch {
+    return;
+  }
+
+  const existing = isRecord(output.metadata) ? output.metadata : {};
+  output.metadata = {
+    ...existing,
+    // This is transport-only result preservation. Whether the completed tool
+    // owns an MCP App is determined later from its current tool definition.
+    openworkMcpApp: appResult,
+  };
+}
+
 const affordanceReadEffects: OpenworkAffordanceEffects = { data: "read", ui: "none", external: false };
 const affordanceWriteEffects: OpenworkAffordanceEffects = { data: "write", ui: "none", external: false };
 const affordanceExternalWriteEffects: OpenworkAffordanceEffects = { data: "write", ui: "none", external: true };
+// A proposal writes nothing anywhere: it is rendered for a person to act on.
+const affordanceProposalEffects: OpenworkAffordanceEffects = { data: "none", ui: "none", external: false };
 
 function affordanceResult(
   id: string,
@@ -451,6 +480,13 @@ async function executeOpenworkAffordance(
       request.id,
       await createOpenWorkSessions(request.args ?? {}, context),
       affordanceWriteEffects,
+    );
+  }
+  if (request.id === "automation.propose") {
+    return affordanceResult(
+      request.id,
+      proposeAutomation(request.args ?? {}),
+      affordanceProposalEffects,
     );
   }
   if (request.id === "extension.call") {
@@ -832,6 +868,24 @@ async function createOpenWorkSessions(rawArgs: unknown, context: OpenCodeContext
   };
 }
 
+/**
+ * Validates a proposed Automation and hands it back for the renderer to show.
+ *
+ * Deliberately does no I/O. Automations are active from the moment they exist,
+ * and the Den credential lives in the renderer, so an agent can describe an
+ * Automation but only a person can create one.
+ */
+function proposeAutomation(rawArgs: unknown): object {
+  const proposal = automationProposalSchema.parse(rawArgs);
+  return {
+    ok: true,
+    kind: "automation-proposal",
+    proposal,
+    created: false,
+    limitation: "This Desktop proposal creates Desktop placement and runs only while a signed-in desktop runner is connected. Use Web or Cloud Chat to create headless Cloud placement.",
+  };
+}
+
 async function postJson(path: string, body: ExtensionActionPayload | Record<string, unknown>): Promise<unknown> {
   const { url, token } = requireOpenWorkServer();
   const response = await fetch(url + path, {
@@ -865,14 +919,22 @@ export const OpenWorkExtensionsPreview = async (factoryInput?: unknown) => {
   const engineMcpStatusClient = readEngineMcpStatusClient(factoryInput);
   const engineMcpStatusDirectory = factoryContext.directory ?? factoryContext.worktree;
   return {
+  "tool.execute.after": async (_input: unknown, output: unknown) => {
+    // OpenCode 1.17.x keeps the text projection of an MCP result but drops
+    // structuredContent and result _meta before persisting the completed tool
+    // part. Preserve those standard fields in the existing metadata channel
+    // so OpenWork can host the UI without replaying the tool call.
+    preserveMcpResult(output);
+  },
   "experimental.chat.system.transform": async (input: unknown, output: { system: string[] }) => {
     const mergedInput = mergeTransformInputWithFactoryContext(input, factoryContext);
-    const [extensionInstruction, skillInstruction] = await Promise.all([
+    const [extensionInstruction, skillInstruction, automationInstruction] = await Promise.all([
       resolveOpenWorkExtensionDiscoveryInstruction(mergedInput, fetch, {
         client: engineMcpStatusClient,
         directory: engineMcpStatusDirectory,
       }),
       resolveOpenWorkConnectSkillInstruction(mergedInput, fetch),
+      resolveOpenWorkAutomationInstruction(mergedInput, fetch),
     ]);
     const skillAuthoring = composeSkillAuthoringInstruction(extensionInstruction);
     if (process.env.OPENWORK_DEV_MODE === "1") {
@@ -882,16 +944,16 @@ export const OpenWorkExtensionsPreview = async (factoryInput?: unknown) => {
         directory: normalizeOpenCodeContext(mergedInput).directory ?? factoryContext.directory ?? null,
       });
     }
-    // One section id per concern — combine drops empties/duplicates so routing,
+    // One section id per concern — composition drops empties/duplicates so routing,
     // remote skills, session, and browser guidance never overlap by accident.
-    const sections = combineInstructionSections(
+    output.system.push(...composeAgentInstructions(
       createInstructionSection("routing", extensionInstruction),
       createInstructionSection("agent-surface", OPENWORK_AGENT_SURFACE_INSTRUCTION),
       createInstructionSection("skill-authoring", skillAuthoring.prompt),
       createInstructionSection("connect-skills", skillInstruction),
+      createInstructionSection("automations", automationInstruction),
       createInstructionSection("browser", OPENWORK_BROWSER_INSTRUCTION),
-    );
-    output.system.push(...composeAgentInstructions(sections));
+    ));
   },
   tool: {
     openwork_context: {
